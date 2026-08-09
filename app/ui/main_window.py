@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self.translator = Translator()
         self._translation_threads: dict[tuple[int, int, int], QThread] = {}
         self._translation_workers: dict[tuple[int, int, int], TranslationWorker] = {}
+        self._inflight: set[tuple[int, int, int]] = set()
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(120)
@@ -237,13 +238,14 @@ class MainWindow(QMainWindow):
         self.translation_panel.select_block(index)
         block = blocks[index]
         thread_key = (self._document_generation, self.current_page, index)
-        if block.translation or block.kind == "formula" or thread_key in self._translation_threads:
+        if block.translation or block.kind == "formula" or thread_key in self._inflight:
             if block.kind == "formula" and not block.translation:
                 block.translation = "公式（见原文）"
                 self.translation_panel.update_block(index, block)
             return
 
         thread = QThread(self)
+        self._inflight.add(thread_key)
         page_number = self.current_page
         worker = TranslationWorker(
             self.translator,
@@ -266,6 +268,7 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _release_translation(self, thread_key: tuple[int, int, int]) -> None:
+        self._inflight.discard(thread_key)
         self._translation_workers.pop(thread_key, None)
         self._translation_threads.pop(thread_key, None)
 
