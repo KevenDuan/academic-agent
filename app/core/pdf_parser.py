@@ -78,6 +78,8 @@ class PDFParser:
             fonts = self._spans_fonts(raw)
             if self._is_subfigure_label(text, fonts):
                 continue
+            if self._is_page_number(text, bbox, page.rect.height):
+                continue
             raw_blocks.append((bbox, text, fonts))
 
         sorted_blocks = self._sort_blocks(raw_blocks, page.rect.width)
@@ -150,6 +152,25 @@ class PDFParser:
             return False
         stripped = "".join(text.splitlines()).strip()
         return len(stripped) <= 4
+
+    @staticmethod
+    def _is_page_number(
+        text: str,
+        bbox: tuple[float, float, float, float],
+        page_height: float,
+    ) -> bool:
+        """过滤页码。页码通常是页面顶部/底部边缘的纯数字（如 '2'、'-3-'）。
+
+        仅当块为纯数字（允许前后连字符）且位于页面顶部/底部 15% 边缘时才判定，
+        正文中的数字（如公式编号、章节号）不在边缘，不会被误删。
+        """
+        stripped = text.strip().strip("-")
+        if not stripped or not stripped.isdigit():
+            return False
+        y0, y1 = bbox[1], bbox[3]
+        near_top = y1 < page_height * 0.15
+        near_bottom = y0 > page_height * 0.85
+        return near_top or near_bottom
 
     @staticmethod
     def _sort_blocks(
