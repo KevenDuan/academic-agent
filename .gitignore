@@ -1,6 +1,13 @@
-**/.vscode/*
-!.vscode/
-!.vscode/launch.json
+.vscode
 .env
 __pycache__/
 *.py[cod]
+
+# 编辑器 / IDE
+.idea/
+*.swp
+
+# 虚拟环境
+.venv/
+venv/
+env/
