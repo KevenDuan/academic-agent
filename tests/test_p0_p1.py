@@ -59,6 +59,32 @@ class P0P1Tests(unittest.TestCase):
         finally:
             document.close()
 
+    def test_short_prose_with_math_symbol_is_not_formula(self):
+        block = Block(
+            page=0,
+            bbox=(0, 0, 1, 1),
+            text="We set α = 0.01 for all experiments.",
+            kind=PDFParser()._classify(
+                "We set α = 0.01 for all experiments.", {"CMMI10", "CMR10"}
+            ),
+        )
+        self.assertNotEqual(block.kind, "formula")
+
+    def test_real_display_formula_is_formula(self):
+        text = "E[∇L(w)] ≤ L(w*) + ε"
+        kind = PDFParser()._classify(text, {"CMMI10"})
+        self.assertEqual(kind, "formula")
+
+    def test_long_prose_with_math_symbol_is_not_formula(self):
+        text = "where wc : Ω→R is the weight map for the convolutional layer"
+        kind = PDFParser()._classify(text, {"CMMI10", "CMR10"})
+        self.assertNotEqual(kind, "formula")
+
+    def test_short_prose_sentence_is_text_not_title(self):
+        text = "We set α = 0.01 for all experiments."
+        kind = PDFParser()._classify(text, {"CMMI10", "CMR10"})
+        self.assertEqual(kind, "text")
+
     def test_translator_uses_openai_compatible_chat_api(self):
         client = FakeClient()
         translated = Translator(client=client, model="test-model").translate_text("Hello")

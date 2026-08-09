@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -177,6 +178,9 @@ class PDFParser:
     def _classify(text: str, fonts: set[str]) -> str:
         if PDFParser._looks_like_formula(text, fonts):
             return "formula"
+        # 完整正文句子（短句 + 数学符号）优先于标题归类
+        if all(PDFParser._is_prose_sentence(line) for line in text.splitlines() if line.strip()):
+            return "text"
         if len(text) <= 120 and len(text.splitlines()) <= 2:
             return "title"
         return "text"
@@ -207,4 +211,25 @@ class PDFParser:
             return False
         short = sum(1 for line in lines if len(line) <= 40)
         # 块内短行占多数 → 显示公式；正文段落是长句为主 → 非公式
-        return short / len(lines) >= 0.5
+        if short / len(lines) < 0.5:
+            return False
+        # 含数学字体的短行也可能是正文句子（如 "We set α = 0.01 ..."），
+        # 若呈完整英文句形态（大写开头 + 句号结尾 + 正文功能词）则视为正文。
+        if all(PDFParser._is_prose_sentence(line) for line in lines):
+            return False
+        return True
+
+    @staticmethod
+    def _is_prose_sentence(line: str) -> bool:
+        """判断短行是否为完整英文句子（正文特征），而非公式。
+
+        公式行通常没有句号结尾、也少见大写开头 + 句子功能词的组合；
+        满足这些特征且长度 ≤ 40 的行，即使夹了数学符号也按正文处理。
+        """
+        stripped = line.strip()
+        if len(stripped) > 40:
+            return False
+        if not stripped.endswith(".") or not stripped[0].isupper():
+            return False
+        # 句子中常见的正文功能词，公式里几乎不会成句出现
+        return bool(re.search(r"\b(the|we|set|for|with|our|can|here|where|this|then)\b", stripped, re.IGNORECASE))
