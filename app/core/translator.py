@@ -4,11 +4,11 @@ import os
 from typing import Any
 
 from openai import OpenAI
-
 from .pdf_parser import Block
 
 
 class TranslationNotConfigured(RuntimeError):
+    """Raised when the translation API is not configured."""
     pass
 
 
@@ -20,6 +20,18 @@ class Translator:
         model: str | None = None,
         client: Any | None = None,
     ) -> None:
+        """
+        Initialize the translator with the given API key, base URL, model, and client.
+
+        Args:
+            api_key (str | None): The API key for the translation service. If not provided, it will be read from the environment variable LLM_API_KEY or OPENAI_API_KEY.
+            base_url (str | None): The base URL for the translation service. If not provided, it will be read from the environment variable LLM_BASE_URL or OPENAI_BASE_URL.
+            model (str | None): The model to use for translation. If not provided, it will be read from the environment variable LLM_MODEL_ID or ACADEMIC_AGENT_MODEL.
+            client (Any | None): An existing client instance to use. If not provided, a new client will be created.
+
+        Returns:
+            None
+        """
         self.model = (
             model
             or os.getenv("LLM_MODEL_ID")
@@ -48,6 +60,14 @@ class Translator:
             self.client = None
 
     def translate_block(self, block: Block) -> str:
+        """Translate a given block of text.
+
+        Args:
+            block (Block): The block of text to translate.
+
+        Returns:
+            str: The translated text.
+        """
         if block.kind == "formula":
             block.translation = "公式（见原文）"
             return block.translation
@@ -56,6 +76,14 @@ class Translator:
         return translation
 
     def translate_text(self, text: str) -> str:
+        """Translate a given string of text.
+
+        Args:
+            text (str): The text to translate.
+
+        Returns:
+            str: The translated text.
+        """
         if not text.strip():
             return ""
         if self.client is None:
