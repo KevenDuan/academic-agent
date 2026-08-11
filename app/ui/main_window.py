@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QImage, QKeySequence, QPixmap
+from PyQt6.QtGui import QAction, QImage, QKeySequence, QPixmap, QIcon
 from PyQt6.QtWidgets import (
     QFileDialog,
     QLabel,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 
 from app.core.pdf_parser import PDFParser, ParsedDocument
 from app.core.translator import Translator
+from app.resources import resource_path
 from app.ui.pdf_viewer import PDFPageView
 from app.ui.translation_panel import TranslationPanel
 
@@ -57,7 +58,8 @@ class TranslationWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, initial_pdf: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("AcademicAgent")
+        self.setWindowTitle("Academic Agent")
+        self.setWindowIcon(QIcon(resource_path("logo.png")))
         self.resize(1440, 900)
         self.parser = PDFParser()
         self.document: ParsedDocument | None = None
