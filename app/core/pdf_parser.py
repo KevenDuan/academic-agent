@@ -9,6 +9,17 @@ import pymupdf
 
 @dataclass
 class Block:
+    """
+    PDF 文本块数据结构。
+
+    Args:
+        page: 页码, 从 0 开始。
+        bbox: 文本块的边界, 格式为 (x_min, y_min, x_max, y_max)。
+        text: 文本块的文本内容。
+        translation: 文本块的翻译内容。默认值为 None。
+        kind: 文本块的类型。默认值为 "text"。
+        order: 文本块的顺序。默认值为 0。
+    """
     page: int
     bbox: tuple[float, float, float, float]
     text: str
@@ -19,6 +30,15 @@ class Block:
 
 @dataclass
 class PageData:
+    """
+    PDF 页数据结构。
+
+    Args:
+        number: 页码, 从 0 开始。
+        width: 页宽。
+        height: 页高。
+        blocks: 页内的文本块列表。
+    """
     number: int
     width: float
     height: float
@@ -27,19 +47,41 @@ class PageData:
 
 class ParsedDocument:
     def __init__(self, path: Path, document: pymupdf.Document, pages: list[PageData]) -> None:
+        """
+        初始化解析后的 PDF 文档。
+
+        Args:
+            path: PDF 文件路径。
+            document: pymupdf.Document 对象。
+            pages: 解析后的页面数据列表。
+        """
         self.path = path
         self._document = document
         self.pages = pages
 
     @property
     def page_count(self) -> int:
+        """返回 PDF 文档的页数。"""
         return len(self.pages)
 
     def render_page(self, page_number: int, dpi: int = 150) -> pymupdf.Pixmap:
+        """
+        渲染指定页为图像。
+
+        Args:
+            page_number: 页码, 从 0 开始。
+            dpi:分辨率, 默认为分辨率, 默认为 150。
+
+        Returns:
+            pymupdf.Pixmap 对象, 表示渲染后的图像。
+        """
         page = self._document.load_page(page_number)
         return page.get_pixmap(dpi=dpi, alpha=False)
 
     def close(self) -> None:
+        """
+        关闭 PDF 文档, 释放资源。
+        """
         if self._document is not None:
             self._document.close()
             self._document = None
@@ -47,6 +89,18 @@ class ParsedDocument:
 
 class PDFParser:
     def parse(self, path: str | Path) -> ParsedDocument:
+        """
+        解析 PDF 文件并返回解析后的文档对象。
+
+        Args:
+            path: PDF 文件路径。
+        
+        Returns:
+            ParsedDocument 对象, 包含解析后的页面数据。
+
+        Raises:
+            Exception: 如果解析过程中发生错误, 将关闭文档并重新抛出异常
+        """
         pdf_path = Path(path).expanduser().resolve()
         document = pymupdf.open(pdf_path)
         pages: list[PageData] = []
@@ -59,6 +113,16 @@ class PDFParser:
         return ParsedDocument(pdf_path, document, pages)
 
     def _parse_page(self, page: pymupdf.Page, page_number: int) -> PageData:
+        """
+        解析 PDF 页并返回解析后的页面数据。
+
+        Args:
+            page: pymupdf.Page 对象。
+            page_number: 页码, 从 0 开始。
+        
+        Returns:
+            PageData: 包含解析后的页面数据。
+        """
         figure_region = self._figure_region(page)
         raw_blocks = []
         for raw in page.get_text("dict").get("blocks", []):
