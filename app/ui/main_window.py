@@ -6,6 +6,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QKeySequence, QPixmap, QIcon
 from PyQt6.QtWidgets import (
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -13,13 +14,17 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from app.core.chat_service import ChatService
 from app.core.pdf_parser import PDFParser, ParsedDocument
+from app.core.session_store import SessionStore
 from app.core.translator import Translator
 from app.resources import resource_path
+from app.ui.chat_panel import ChatPanel, SessionSidebar
 from app.ui.pdf_viewer import PDFPageView
 from app.ui.translation_panel import TranslationPanel
 
@@ -55,8 +60,33 @@ class TranslationWorker(QObject):
             self.failed.emit(self.generation, self.page_number, self.index, str(exc))
 
 
+class ChatWorker(QObject):
+    finished = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, chat_service: ChatService, session_id: str, messages, context: str) -> None:
+        super().__init__()
+        self.chat_service = chat_service
+        self.session_id = session_id
+        self.messages = messages
+        self.context = context
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(
+                self.session_id,
+                self.chat_service.answer(self.messages, self.context),
+            )
+        except Exception as exc:
+            self.failed.emit(self.session_id, str(exc))
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, initial_pdf: str | None = None) -> None:
+    def __init__(
+        self,
+        initial_pdf: str | None = None,
+        session_store: SessionStore | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Academic Agent")
         self.setWindowIcon(QIcon(resource_path("logo.png")))
@@ -66,6 +96,11 @@ class MainWindow(QMainWindow):
         self._document_generation = 0
         self.current_page = 0
         self.translator = Translator()
+        self.chat_service = ChatService(self.translator.client, self.translator.model)
+        self.session_store = session_store or SessionStore()
+        self.current_session_id: str | None = None
+        self._chat_thread: QThread | None = None
+        self._chat_worker: ChatWorker | None = None
         self._translation_threads: dict[tuple[int, int, int], QThread] = {}
         self._translation_workers: dict[tuple[int, int, int], TranslationWorker] = {}
         self._inflight: set[tuple[int, int, int]] = set()
@@ -76,6 +111,8 @@ class MainWindow(QMainWindow):
 
         self.pdf_view = PDFPageView()
         self.translation_panel = TranslationPanel()
+        self.chat_panel = ChatPanel()
+        self.session_sidebar = SessionSidebar()
         self.page_label = QLabel("第 0 / 0 页")
         self.previous_button = QPushButton("上一页")
         self.next_button = QPushButton("下一页")
@@ -105,6 +142,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._connect_signals()
+        self._refresh_sessions()
         if initial_pdf:
             QTimer.singleShot(0, lambda: self.load_pdf(initial_pdf))
 
@@ -134,9 +172,16 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.pdf_view, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.session_sidebar)
         splitter.addWidget(left)
-        splitter.addWidget(self.translation_panel)
-        splitter.setSizes([900, 500])
+        right_tabs = QTabWidget()
+        right_tabs.addTab(self.translation_panel, "译文")
+        right_tabs.addTab(self.chat_panel, "对话")
+        splitter.addWidget(right_tabs)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 1)
+        splitter.setSizes([230, 760, 450])
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("请选择一个 PDF 文件")
         self.setStyleSheet(
@@ -145,6 +190,8 @@ class MainWindow(QMainWindow):
             QListWidget, QSpinBox { background: #17191d; border: 1px solid #343a46; }
             QListWidget::item { padding: 0px; border-bottom: 1px solid #2d323c; }
             QListWidget::item:selected { background: #394455; }
+            QLabel#sidebarTitle { font-size: 18px; font-weight: 600; padding: 4px 2px 8px 2px; }
+            QTextBrowser, QTextEdit { background: #17191d; border: 1px solid #343a46; padding: 8px; }
             QPushButton { background: #303642; border: 1px solid #454e5e; padding: 6px 12px; }
             QPushButton:hover { background: #3d4758; }
             """
@@ -164,6 +211,11 @@ class MainWindow(QMainWindow):
         self.page_spin.valueChanged.connect(lambda value: self.show_page(value - 1))
         self.pdf_view.blockClicked.connect(self.select_block)
         self.translation_panel.blockSelected.connect(self.select_block)
+        self.session_sidebar.sessionSelected.connect(self.activate_session)
+        self.session_sidebar.newSessionRequested.connect(self.new_session)
+        self.session_sidebar.renameSessionRequested.connect(self.rename_session)
+        self.session_sidebar.deleteSessionRequested.connect(self.delete_session)
+        self.chat_panel.messageSubmitted.connect(self.send_chat_message)
 
     def open_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "打开 PDF", "", "PDF 文件 (*.pdf)")
@@ -181,6 +233,9 @@ class MainWindow(QMainWindow):
         self._document_generation += 1
         self.document = parsed
         self.current_page = 0
+        if self.current_session_id:
+            self.session_store.set_paper(self.current_session_id, str(parsed.path))
+            self._refresh_sessions(self.current_session_id)
         self.page_spin.setMaximum(max(1, parsed.page_count))
         self.translation_panel.set_blocks(parsed.pages[0].blocks if parsed.pages else [])
         self.show_page(0)
@@ -303,10 +358,149 @@ class MainWindow(QMainWindow):
                 self.translation_panel.update_block(index, block)
             self.translation_panel.select_block(index)
 
+    def _refresh_sessions(self, selected_id: str | None = None) -> None:
+        sessions = self.session_store.list_sessions()
+        selected_id = selected_id or self.current_session_id
+        if selected_id is None and sessions:
+            selected_id = sessions[0].session_id
+        self.session_sidebar.set_sessions(sessions, selected_id)
+        if selected_id:
+            self.activate_session(selected_id)
+        else:
+            self.current_session_id = None
+            self.chat_panel.show_messages([])
+
+    def new_session(self) -> None:
+        paper_id = str(self.document.path) if self.document else None
+        session = self.session_store.create_session(paper_id=paper_id)
+        self._refresh_sessions(session.session_id)
+
+    def activate_session(self, session_id: str) -> None:
+        try:
+            session = self.session_store.get_session(session_id)
+        except KeyError:
+            self._refresh_sessions()
+            return
+        self.current_session_id = session_id
+        self.chat_panel.show_messages(self.session_store.get_messages(session_id))
+        if session.paper_id:
+            paper_path = Path(session.paper_id)
+            current_path = self.document.path if self.document else None
+            if paper_path.exists() and current_path != paper_path.resolve():
+                self.load_pdf(paper_path)
+            elif not paper_path.exists():
+                self.chat_panel.set_busy(False, "关联的论文文件已移动，请重新打开 PDF。")
+
+    def rename_session(self) -> None:
+        if not self.current_session_id:
+            return
+        session = self.session_store.get_session(self.current_session_id)
+        title, accepted = QInputDialog.getText(self, "重命名会话", "会话名称", text=session.title)
+        if accepted and title.strip():
+            self.session_store.rename_session(self.current_session_id, title)
+            self._refresh_sessions(self.current_session_id)
+
+    def delete_session(self) -> None:
+        if not self.current_session_id:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除会话",
+            "确定删除当前会话及其聊天记录吗？论文文件不会被删除。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        session_id = self.current_session_id
+        self.current_session_id = None
+        self.session_store.delete_session(session_id)
+        self._refresh_sessions()
+
+    def send_chat_message(self, text: str) -> None:
+        if self._chat_thread and self._chat_thread.isRunning():
+            return
+        if not self.current_session_id:
+            self.new_session()
+        if not self.current_session_id:
+            return
+        session_id = self.current_session_id
+        existing_messages = self.session_store.get_messages(session_id)
+        self.session_store.add_message(session_id, "user", text)
+        if not existing_messages:
+            self.session_store.rename_session(session_id, text[:40])
+        messages = self.session_store.get_messages(session_id)
+        self.chat_panel.clear_input()
+        self.chat_panel.show_messages(messages)
+        self.chat_panel.set_busy(True, "正在思考…")
+        self.session_sidebar.set_busy(True)
+        self._refresh_sessions(session_id)
+
+        thread = QThread(self)
+        worker = ChatWorker(
+            self.chat_service,
+            session_id,
+            messages,
+            self._paper_context(),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._chat_finished)
+        worker.failed.connect(self._chat_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._release_chat_worker)
+        self._chat_thread = thread
+        self._chat_worker = worker
+        thread.start()
+
+    def _paper_context(self, max_chars: int = 32000) -> str:
+        if not self.document:
+            return ""
+        parts = []
+        used_chars = 0
+        for page in self.document.pages:
+            page_text = "\n".join(
+                block.text for block in page.blocks if block.kind != "formula"
+            )
+            chunk = f"[第 {page.number + 1} 页]\n{page_text}\n"
+            if parts and used_chars + len(chunk) > max_chars:
+                break
+            parts.append(chunk[: max_chars - used_chars])
+            used_chars += len(parts[-1])
+            if used_chars >= max_chars:
+                break
+        return "\n".join(parts)
+
+    def _chat_finished(self, session_id: str, answer: str) -> None:
+        self.session_store.add_message(session_id, "assistant", answer)
+        self.chat_panel.set_busy(False)
+        self.session_sidebar.set_busy(False)
+        if session_id == self.current_session_id:
+            self.chat_panel.show_messages(self.session_store.get_messages(session_id))
+        self._refresh_sessions(self.current_session_id)
+        self.statusBar().showMessage("回答完成")
+
+    def _chat_failed(self, session_id: str, message: str) -> None:
+        self.chat_panel.set_busy(False)
+        self.session_sidebar.set_busy(False)
+        if session_id == self.current_session_id:
+            self.chat_panel.set_busy(False, message)
+        self.statusBar().showMessage(message)
+
+    def _release_chat_worker(self) -> None:
+        self._chat_worker = None
+        self._chat_thread = None
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._chat_thread and self._chat_thread.isRunning():
+            self.chat_panel.set_busy(True, "模型仍在响应，请等待完成后再关闭。")
+            self.session_sidebar.set_busy(True)
+            event.ignore()
+            return
         for thread in self._translation_threads.values():
             thread.quit()
             thread.wait(1000)
         if self.document:
             self.document.close()
+        self.session_store.close()
         event.accept()
