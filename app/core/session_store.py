@@ -27,6 +27,18 @@ class Message:
     content: str | None
     tool_calls: object | None
     created_at: str
+    metadata: object | None = None
+
+
+def selected_passage_from_metadata(
+    metadata: object | None,
+) -> dict[str, object] | None:
+    if not isinstance(metadata, dict):
+        return None
+    passage = metadata.get("selected_passage")
+    if not isinstance(passage, dict) or not passage.get("text"):
+        return None
+    return passage
 
 
 class SessionStore:
@@ -65,6 +77,7 @@ class SessionStore:
                     role TEXT NOT NULL,
                     content TEXT,
                     tool_calls_json TEXT,
+                    metadata_json TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -74,6 +87,14 @@ class SessionStore:
                     ON messages(session_id, created_at, message_id);
                 """
             )
+            columns = {
+                row["name"]
+                for row in self._connection.execute("PRAGMA table_info(messages)")
+            }
+            if "metadata_json" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE messages ADD COLUMN metadata_json TEXT"
+                )
 
     @staticmethod
     def _now() -> str:
@@ -141,6 +162,7 @@ class SessionStore:
         role: str,
         content: str | None,
         tool_calls: object | None = None,
+        metadata: object | None = None,
     ) -> Message:
         if role not in self.valid_roles:
             raise ValueError(f"不支持的消息角色：{role}")
@@ -148,13 +170,24 @@ class SessionStore:
         tool_calls_json = (
             json.dumps(tool_calls, ensure_ascii=False) if tool_calls is not None else None
         )
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None
+        )
         with self._connection:
             cursor = self._connection.execute(
                 """
-                INSERT INTO messages(session_id, role, content, tool_calls_json, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO messages(
+                    session_id, role, content, tool_calls_json, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, role, content, tool_calls_json, timestamp),
+                (
+                    session_id,
+                    role,
+                    content,
+                    tool_calls_json,
+                    metadata_json,
+                    timestamp,
+                ),
             )
             self._connection.execute(
                 "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
@@ -167,6 +200,7 @@ class SessionStore:
             content=content,
             tool_calls=tool_calls,
             created_at=timestamp,
+            metadata=metadata,
         )
 
     def get_messages(self, session_id: str) -> list[Message]:
@@ -193,6 +227,7 @@ class SessionStore:
     @staticmethod
     def _to_message(row: sqlite3.Row) -> Message:
         raw_tool_calls = row["tool_calls_json"]
+        raw_metadata = row["metadata_json"]
         return Message(
             message_id=row["message_id"],
             session_id=row["session_id"],
@@ -200,8 +235,8 @@ class SessionStore:
             content=row["content"],
             tool_calls=json.loads(raw_tool_calls) if raw_tool_calls else None,
             created_at=row["created_at"],
+            metadata=json.loads(raw_metadata) if raw_metadata else None,
         )
 
     def close(self) -> None:
         self._connection.close()
-
