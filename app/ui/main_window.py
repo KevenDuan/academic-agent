@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QSize, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QKeySequence, QPixmap, QIcon
 from PyQt6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -14,21 +15,31 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QSpinBox,
     QSplitter,
+    QSizePolicy,
     QTabWidget,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
 from app.core.chat_service import ChatService
+from app.config import AppSettings
+from app.agent.agent_loop import AgentLoop
+from app.agent.registry import SkillRegistry
+from app.agent.skills import default_skills_dir
 from app.core.pdf_parser import PDFParser, ParsedDocument
 from app.core.rag_engine import RagEngine
 from app.core.session_store import SessionStore, selected_passage_from_metadata
 from app.core.translator import Translator
 from app.resources import resource_path
-from app.ui.chat_panel import ChatPanel, SessionSidebar
+from app.ui.chat_panel import ChatPanel, ElidedLabel, SessionSidebar
+from app.ui.icons import app_icon
 from app.ui.paper_library_dialog import PaperLibraryDialog
 from app.ui.pdf_viewer import PDFPageView
+from app.ui.settings_dialog import SettingsDialog
+from app.ui.theme import codex_dark_stylesheet
 from app.ui.translation_panel import TranslationPanel
+from app.settings_store import SettingsStore
 
 
 class TranslationWorker(QObject):
@@ -65,6 +76,7 @@ class TranslationWorker(QObject):
 class ChatWorker(QObject):
     finished = pyqtSignal(str, str)
     failed = pyqtSignal(str, str)
+    toolsUsed = pyqtSignal(str, object)
     MAX_PAPER_CONTEXT_CHARS = 32000
 
     def __init__(
@@ -76,6 +88,8 @@ class ChatWorker(QObject):
         query: str,
         current_paper_path: str | None,
         fallback_context: str,
+        agent_loop: AgentLoop | None = None,
+        use_rag: bool = True,
     ) -> None:
         super().__init__()
         self.chat_service = chat_service
@@ -85,6 +99,8 @@ class ChatWorker(QObject):
         self.query = query
         self.current_paper_path = current_paper_path
         self.fallback_context = fallback_context
+        self.agent_loop = agent_loop
+        self.use_rag = use_rag
 
     def run(self) -> None:
         try:
@@ -93,28 +109,43 @@ class ChatWorker(QObject):
                 if self.messages
                 else None
             )
-            results = (
-                []
-                if selected_passage is not None
-                else self.rag_engine.search(self.query, top_k=5)
-            )
-            context = self.rag_engine.format_context(results)
-            current_is_indexed = bool(
-                selected_passage is None
-                and self.current_paper_path
-                and self.rag_engine.contains_document(self.current_paper_path)
-            )
-            if (
-                self.fallback_context
-                and selected_passage is None
-                and (not results or not current_is_indexed)
-            ):
-                context = "\n\n".join(part for part in (context, self.fallback_context) if part)
+            if self.agent_loop is not None:
+                current_is_indexed = bool(
+                    selected_passage is not None
+                    or (
+                        self.current_paper_path
+                        and self.rag_engine.contains_document(self.current_paper_path)
+                    )
+                )
+                context = "" if selected_passage is not None or current_is_indexed else self.fallback_context
+            elif not self.use_rag:
+                context = self.fallback_context
+            else:
+                results = (
+                    []
+                    if selected_passage is not None
+                    else self.rag_engine.search(self.query, top_k=5)
+                )
+                context = self.rag_engine.format_context(results)
+                current_is_indexed = bool(
+                    selected_passage is None
+                    and self.current_paper_path
+                    and self.rag_engine.contains_document(self.current_paper_path)
+                )
+                if (
+                    self.fallback_context
+                    and selected_passage is None
+                    and (not results or not current_is_indexed)
+                ):
+                    context = "\n\n".join(part for part in (context, self.fallback_context) if part)
             context = context[: self.MAX_PAPER_CONTEXT_CHARS]
-            self.finished.emit(
-                self.session_id,
-                self.chat_service.answer(self.messages, context),
-            )
+            if self.agent_loop is not None:
+                result = self.agent_loop.answer(self.messages, context)
+                self.toolsUsed.emit(self.session_id, result.tool_traces)
+                answer = result.answer
+            else:
+                answer = self.chat_service.answer(self.messages, context)
+            self.finished.emit(self.session_id, answer)
         except Exception as exc:
             self.failed.emit(self.session_id, str(exc))
 
@@ -144,19 +175,37 @@ class MainWindow(QMainWindow):
         initial_pdf: str | None = None,
         session_store: SessionStore | None = None,
         rag_engine: RagEngine | None = None,
+        settings_store: SettingsStore | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Academic Agent")
         self.setWindowIcon(QIcon(resource_path("logo.png")))
         self.resize(1440, 900)
+        self.setMinimumSize(1040, 680)
         self.parser = PDFParser()
         self.document: ParsedDocument | None = None
         self._document_generation = 0
         self.current_page = 0
-        self.translator = Translator()
+        self.settings_store = settings_store or SettingsStore()
+        self.settings = self.settings_store.load()
+        self.settings.apply_to_environment()
+        self.translator = Translator(
+            api_key=self.settings.api_key or None,
+            base_url=self.settings.base_url or None,
+            model=self.settings.model,
+        )
         self.chat_service = ChatService(self.translator.client, self.translator.model)
         self.session_store = session_store or SessionStore()
+        self._rag_engine_injected = rag_engine is not None
         self.rag_engine = rag_engine or RagEngine()
+        self.skill_registry = SkillRegistry(default_skills_dir())
+        self.agent_loop = AgentLoop(
+            self.translator.client,
+            self.translator.model,
+            self.skill_registry,
+            self.rag_engine,
+            self.translator,
+        )
         self.current_session_id: str | None = None
         self._selected_passage: dict[str, object] | None = None
         self._chat_thread: QThread | None = None
@@ -175,17 +224,33 @@ class MainWindow(QMainWindow):
         self.translation_panel = TranslationPanel()
         self.chat_panel = ChatPanel()
         self.session_sidebar = SessionSidebar()
+        self.document_title = ElidedLabel()
+        self.document_title.set_full_text("未打开论文")
+        self.document_title.setObjectName("documentTitle")
+        self.document_meta = QLabel("PDF")
+        self.document_meta.setObjectName("documentMeta")
         self.page_label = QLabel("第 0 / 0 页")
-        self.previous_button = QPushButton("上一页")
-        self.next_button = QPushButton("下一页")
-        self.zoom_out_button = QPushButton("−")
+        self.previous_button = QPushButton()
+        self.next_button = QPushButton()
+        self.zoom_out_button = QPushButton()
         self.zoom_reset_button = QPushButton("100%")
-        self.zoom_in_button = QPushButton("+")
-        self.fit_button = QPushButton("适应")
+        self.zoom_in_button = QPushButton()
+        self.fit_button = QPushButton()
         self.page_spin = QSpinBox()
         self.page_spin.setMinimum(1)
         self.page_spin.setMaximum(1)
         self.page_spin.setFixedWidth(72)
+        for button, icon, tooltip in (
+            (self.previous_button, "fa5s.chevron-left", "上一页"),
+            (self.next_button, "fa5s.chevron-right", "下一页"),
+            (self.zoom_out_button, "fa5s.search-minus", "缩小"),
+            (self.zoom_in_button, "fa5s.search-plus", "放大"),
+            (self.fit_button, "fa5s.expand", "适应页面"),
+        ):
+            button.setIcon(app_icon(icon))
+            button.setToolTip(tooltip)
+            button.setObjectName("iconButton")
+            button.setFixedSize(30, 28)
         for button in (
             self.zoom_out_button,
             self.zoom_reset_button,
@@ -193,14 +258,8 @@ class MainWindow(QMainWindow):
             self.fit_button,
         ):
             button.setFixedHeight(28)
-        self.zoom_out_button.setFixedWidth(34)
         self.zoom_reset_button.setFixedWidth(58)
-        self.zoom_in_button.setFixedWidth(34)
-        self.fit_button.setFixedWidth(52)
-        self.zoom_out_button.setToolTip("缩小")
         self.zoom_reset_button.setToolTip("重置缩放")
-        self.zoom_in_button.setToolTip("放大")
-        self.fit_button.setToolTip("适应页面")
 
         self._build_ui()
         self._connect_signals()
@@ -210,23 +269,64 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
-        open_action = QAction("打开 PDF", self)
-        open_action.setShortcut(QKeySequence.StandardKey.Open)
-        open_action.triggered.connect(self.open_pdf)
-        file_menu.addAction(open_action)
+        self.open_action = QAction(app_icon("fa5s.folder-open"), "打开 PDF", self)
+        self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self.open_action.setToolTip("打开 PDF")
+        self.open_action.triggered.connect(self.open_pdf)
+        file_menu.addAction(self.open_action)
         self.add_to_library_action = QAction("将当前论文加入论文库", self)
+        self.add_to_library_action.setIcon(app_icon("fa5s.bookmark"))
+        self.add_to_library_action.setToolTip("将当前论文加入论文库")
         self.add_to_library_action.setEnabled(False)
         self.add_to_library_action.triggered.connect(self.add_current_to_library)
         file_menu.addAction(self.add_to_library_action)
         self.manage_library_action = QAction("管理论文库", self)
+        self.manage_library_action.setIcon(app_icon("fa5s.book"))
+        self.manage_library_action.setToolTip("管理论文库")
         self.manage_library_action.triggered.connect(self.show_paper_library)
         file_menu.addAction(self.manage_library_action)
+
+        settings_menu = self.menuBar().addMenu("应用")
+        self.settings_action = QAction(app_icon("fa5s.cog"), "设置", self)
+        self.settings_action.setToolTip("模型与服务设置")
+        self.settings_action.triggered.connect(self.show_settings)
+        settings_menu.addAction(self.settings_action)
+
+        view_menu = self.menuBar().addMenu("视图")
+        self.sidebar_action = QAction(app_icon("fa5s.columns"), "显示最近对话", self)
+        self.sidebar_action.setCheckable(True)
+        self.sidebar_action.setChecked(True)
+        self.sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
+        self.sidebar_action.setToolTip("显示或隐藏最近对话")
+        self.sidebar_action.triggered.connect(self.toggle_session_sidebar)
+        view_menu.addAction(self.sidebar_action)
+
+        toolbar = QToolBar("主工具栏", self)
+        toolbar.setObjectName("mainToolbar")
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.addAction(self.sidebar_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.open_action)
+        toolbar.addAction(self.add_to_library_action)
+        toolbar.addAction(self.manage_library_action)
+        toolbar.addSeparator()
+        toolbar_spacer = QWidget()
+        toolbar_spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        toolbar.addWidget(toolbar_spacer)
+        toolbar.addAction(self.settings_action)
+        self.addToolBar(toolbar)
+        self.main_toolbar = toolbar
 
         page_controls = QHBoxLayout()
         page_controls.setContentsMargins(0, 0, 0, 0)
         page_controls.addWidget(self.previous_button)
         page_controls.addWidget(self.next_button)
-        page_controls.addSpacing(12)
+        page_controls.addSpacing(6)
         page_controls.addWidget(self.zoom_out_button)
         page_controls.addWidget(self.zoom_reset_button)
         page_controls.addWidget(self.zoom_in_button)
@@ -235,43 +335,46 @@ class MainWindow(QMainWindow):
         page_controls.addWidget(self.page_label)
         page_controls.addWidget(self.page_spin)
 
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.addLayout(page_controls)
-        left_layout.addWidget(self.pdf_view, 1)
+        document_heading = QVBoxLayout()
+        document_heading.setContentsMargins(0, 0, 0, 0)
+        document_heading.setSpacing(1)
+        document_heading.addWidget(self.document_title)
+        document_heading.addWidget(self.document_meta)
+        document_header = QHBoxLayout()
+        document_header.setContentsMargins(0, 0, 0, 0)
+        document_header.addLayout(document_heading, 1)
+        document_header.addLayout(page_controls)
+        document_header_widget = QWidget()
+        document_header_widget.setLayout(document_header)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.session_sidebar)
-        splitter.addWidget(left)
-        right_tabs = QTabWidget()
-        right_tabs.addTab(self.translation_panel, "译文")
-        right_tabs.addTab(self.chat_panel, "对话")
-        splitter.addWidget(right_tabs)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 1)
-        splitter.setSizes([230, 760, 450])
-        self.setCentralWidget(splitter)
+        document_pane = QWidget()
+        document_pane.setObjectName("documentPane")
+        document_layout = QVBoxLayout(document_pane)
+        document_layout.setContentsMargins(10, 8, 10, 10)
+        document_layout.setSpacing(8)
+        document_layout.addWidget(document_header_widget)
+        document_layout.addWidget(self.pdf_view, 1)
+
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(self.session_sidebar)
+        self.workspace_splitter.addWidget(document_pane)
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setObjectName("workspaceTabs")
+        self.right_tabs.addTab(self.translation_panel, app_icon("fa5s.language"), "译文")
+        self.right_tabs.addTab(self.chat_panel, app_icon("fa5s.comment-alt"), "对话")
+        self.workspace_splitter.addWidget(self.right_tabs)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setStretchFactor(2, 1)
+        self.workspace_splitter.setSizes([230, 760, 450])
+        self.setCentralWidget(self.workspace_splitter)
         self.statusBar().showMessage("请选择一个 PDF 文件")
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget { background: #202328; color: #e6e9ef; }
-            QListWidget { background: #17191d; alternate-background-color: #1d2025; border: 1px solid #343a46; }
-            QSpinBox { background: #17191d; border: 1px solid #343a46; }
-            QListWidget::item { padding: 0px; border-bottom: 1px solid #2d323c; }
-            QListWidget::item:selected { background: #394455; }
-            QLabel#sidebarTitle { font-size: 18px; font-weight: 600; padding: 4px 2px 8px 2px; }
-            QTextBrowser, QTextEdit { background: #17191d; border: 1px solid #343a46; padding: 8px; }
-            QPushButton { background: #303642; border: 1px solid #454e5e; padding: 6px 12px; }
-            QPushButton:hover { background: #3d4758; }
-            QWidget#passageAttachment { background: #292f38; border: 1px solid #465064; border-radius: 4px; }
-            QWidget#passageAttachment QLabel { background: transparent; border: none; }
-            QLabel#passageAttachmentTitle { font-weight: 600; }
-            QLabel#passageAttachmentPreview { color: #aeb8c8; }
-            QPushButton#clearPassageButton { padding: 0px; font-size: 18px; }
-            """
-        )
+        self.setStyleSheet(codex_dark_stylesheet())
+
+    def toggle_session_sidebar(self, visible: bool) -> None:
+        self.session_sidebar.setVisible(visible)
+        self.sidebar_action.setChecked(visible)
 
     def _connect_signals(self) -> None:
         self.previous_button.clicked.connect(self.previous_page)
@@ -311,6 +414,9 @@ class MainWindow(QMainWindow):
         self._document_generation += 1
         self.document = parsed
         self.current_page = 0
+        self.document_title.set_full_text(parsed.path.stem)
+        self.document_title.setToolTip(str(parsed.path))
+        self.document_meta.setText(f"PDF · {parsed.page_count} 页")
         self.add_to_library_action.setEnabled(True)
         if self.current_session_id:
             self.session_store.set_paper(self.current_session_id, str(parsed.path))
@@ -374,6 +480,37 @@ class MainWindow(QMainWindow):
             lambda paper_id: self._remove_library_paper(dialog, paper_id)
         )
         dialog.exec()
+
+    def show_settings(self) -> None:
+        dialog = SettingsDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.settings()
+        try:
+            self.settings_store.save(settings)
+        except OSError as exc:
+            QMessageBox.critical(self, "无法保存设置", str(exc))
+            return
+        self._apply_runtime_settings(settings)
+        self.statusBar().showMessage("设置已保存并应用")
+
+    def _apply_runtime_settings(self, settings: AppSettings) -> None:
+        settings.apply_to_environment()
+        translator = Translator(
+            api_key=settings.api_key or None,
+            base_url=settings.base_url or None,
+            model=settings.model,
+        )
+        self.settings = settings
+        self.translator = translator
+        self.chat_service = ChatService(translator.client, translator.model)
+        self.agent_loop = AgentLoop(
+            translator.client,
+            translator.model,
+            self.skill_registry,
+            self.rag_engine,
+            translator,
+        )
 
     def _open_library_paper(self, dialog: PaperLibraryDialog, path: str) -> None:
         paper_path = Path(path)
@@ -637,11 +774,14 @@ class MainWindow(QMainWindow):
             text,
             str(self.document.path) if self.document else None,
             self._paper_context(),
+            self.agent_loop if isinstance(self.chat_service, ChatService) else None,
+            self._rag_engine_injected,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._chat_finished)
         worker.failed.connect(self._chat_failed)
+        worker.toolsUsed.connect(self._chat_tools_used)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -649,6 +789,19 @@ class MainWindow(QMainWindow):
         self._chat_thread = thread
         self._chat_worker = worker
         thread.start()
+
+    def _chat_tools_used(self, session_id: str, traces) -> None:
+        for trace in traces:
+            self.session_store.add_message(
+                session_id,
+                "tool",
+                trace.result,
+                tool_calls={
+                    "name": trace.name,
+                    "arguments": trace.arguments,
+                    "tool_call_id": trace.tool_call_id,
+                },
+            )
 
     def clear_selected_passage(self) -> None:
         self._selected_passage = None
