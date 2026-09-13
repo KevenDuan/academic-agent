@@ -18,16 +18,20 @@ persistent conversations, and tool-using LLM workflows in a PyQt6 desktop applic
 
 ## Current status
 
-P0 through P2 are implemented: open a digital PDF, render pages, extract text
+P0 through P3 are implemented: open a digital PDF, render pages, extract text
 blocks with PDF coordinates, request block-level Chinese translations, and ask
-an OpenAI-compatible model questions about the current paper. Chat sessions and
-their paper associations are stored locally in SQLite and restored after restart.
+an OpenAI-compatible model questions across a local paper library. Chat sessions
+and paper metadata are stored locally in SQLite; BGE-M3 and FAISS provide
+GPU-accelerated multilingual retrieval with title and page citations.
+Selecting a PDF block also creates a removable chat attachment for focused
+questions about that passage.
 
 ## Run locally
 
 ```powershell
 conda activate academic_agent
 python -m pip install -r requirements.txt
+python -m pip install --force-reinstall --no-deps -r requirements-cuda.txt
 python -m app.main data/Unet.pdf
 ```
 
@@ -41,6 +45,28 @@ the center, and translation/chat tabs on the right. Right-click the conversation
 sidebar to create, rename, or delete a session. The local database is stored
 in the operating system's AcademicAgent user data directory; deleting a
 conversation never deletes its PDF file.
+
+## Selected-passage questions
+
+Select a text block in the PDF or translation list to translate it and attach
+it to the chat composer. The next question sends the selected original text,
+its available Chinese translation, paper title, and page number to the LLM.
+For that turn, AcademicAgent skips whole-paper fallback context and paper-library
+retrieval so the answer stays focused on the selected passage. The attachment is
+stored with the user message and remains visible after reopening the session.
+
+## Paper library and RAG
+
+Open a PDF and select `文件 → 将当前论文加入论文库`. Indexing runs in the
+background. The first use downloads `BAAI/bge-m3`; later runs use the local
+Hugging Face cache. `文件 → 管理论文库` opens or removes indexed papers without
+deleting the original PDF.
+
+For each question, AcademicAgent retrieves at most five relevant blocks across
+the library and sends their text, paper title, and page number to the configured
+LLM. Answers are prompted to retain `[来源N]` citations. Paper metadata and
+embeddings are stored in `%LOCALAPPDATA%/AcademicAgent/papers.db`; the rebuildable
+FAISS cache is `%LOCALAPPDATA%/AcademicAgent/papers.faiss`.
 
 Run the local checks with:
 
