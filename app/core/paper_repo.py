@@ -110,11 +110,13 @@ class PaperRepository:
 
     def ensure_model(self, model: str, dimension: int) -> None:
         current = self.get_model_info()
-        if current is not None and current != (model, dimension):
-            raise RuntimeError(
-                "论文库使用的 Embedding 模型与当前配置不一致："
-                f"{current[0]} ({current[1]}维) != {model} ({dimension}维)"
-            )
+        if current is not None:
+            if current != (model, dimension):
+                raise RuntimeError(
+                    "论文库使用的 Embedding 模型与当前配置不一致："
+                    f"{current[0]} ({current[1]}维) != {model} ({dimension}维)"
+                )
+            return
         with self._connection:
             self._connection.executemany(
                 "INSERT OR REPLACE INTO paper_settings(key, value) VALUES (?, ?)",
@@ -285,6 +287,30 @@ class PaperRepository:
             )
             for row in rows
         }
+
+    def get_paper_blocks(self, paper_id: str) -> list[IndexedBlock]:
+        rows = self._connection.execute(
+            """
+            SELECT b.*, p.title AS paper_title
+            FROM paper_blocks b
+            JOIN papers p ON p.paper_id = b.paper_id
+            WHERE b.paper_id = ?
+            ORDER BY b.page, b.block_order
+            """,
+            (paper_id,),
+        ).fetchall()
+        return [
+            IndexedBlock(
+                block_id=row["block_id"],
+                paper_id=row["paper_id"],
+                paper_title=row["paper_title"],
+                page=row["page"],
+                bbox=tuple(json.loads(row["bbox_json"])),
+                kind=row["kind"],
+                text=row["text"],
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _to_paper(row: sqlite3.Row) -> PaperRecord:
