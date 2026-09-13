@@ -57,9 +57,9 @@ class PDFPageCanvas(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt API
         del event
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#17191d"))
+        painter.fillRect(self.rect(), QColor("#252628"))
         if self._image.isNull():
-            painter.setPen(QColor("#9aa4b2"))
+            painter.setPen(QColor("#a8afab"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "打开 PDF 以开始阅读")
             return
 
