@@ -143,8 +143,8 @@ AcademicAgent/
 | GUI 框架 | **PyQt6** | 成熟、文档全;Qt 6.4+ 支持 markdown 渲染 |
 | PDF 解析/渲染 | **PyMuPDF (fitz)** | 渲染页面为图片 + `get_text("dict")` 抽块,坐标天然同源对齐 |
 | 大模型 API | **openai SDK** | DeepSeek / OpenAI 通用(仅 `base_url` 不同),兼容性最好 |
-| 本地 Embedding | **sentence-transformers** | 免费、本地、隐私友好;中文可用 `paraphrase-multilingual` 系列模型 |
-| 向量检索 | **FAISS** | 本地轻量向量库,免部署 |
+| 本地 Embedding | **BGE-M3 + sentence-transformers** | GPU 本地运行,适合中文问题检索英文论文;1024 维稠密向量 |
+| 向量检索 | **FAISS + SQLite** | SQLite 保存论文/块/向量真值,FAISS 是可校验、可重建的检索缓存 |
 | 会话持久化 | **SQLite + platformdirs** | 保存聊天记录;SQLite 使用 Python 标准库,platformdirs 定位用户数据目录 |
 | UI 美化 | **QSS 样式表** | 深色主题;图标可用 QtAwesome(免费图标字体) |
 | Web 搜索 | **Tavily API**(推荐)/ DuckDuckGo / SearXNG(自建) | Tavily 专为 LLM 设计、有免费额度、返回结构化摘要;DuckDuckGo 免费但稳定性/速率受限;SearXNG 无隐私依赖需自部署 |
@@ -156,7 +156,7 @@ AcademicAgent/
 |------|---------|------|
 | 划段翻译 | `deepseek-chat` | 便宜、速度快,翻译任务用不上顶级模型 |
 | 对话/总结 | DeepSeek 或 `gpt-4o` | 质量优先,用户可切换 |
-| Embedding | 本地 `sentence-transformers` | 免费离线,论文库规模小足够 |
+| Embedding | 本地 `BAAI/bge-m3` | 多语言长文本检索;当前 RTX 5060 Ti 使用 CUDA 加速 |
 
 > **关键设计**:模型访问统一封装。配置只需 `base_url` / `api_key` / `model` 三个字段,DeepSeek 与 OpenAI 走同一套 SDK 代码。
 
@@ -230,13 +230,15 @@ class Paper:
 ```
 注册论文
   → 复用 PDFParser 的分块结果(一份数据两用,D5)
-  → 对每块文本做 embedding(sentence-transformers)
-  → 存入 FAISS 索引 + 元数据(paper_id, page, bbox)
+  → BGE-M3 对每块文本生成 1024 维归一化 embedding
+  → SQLite 保存论文/块/bbox/embedding
+  → FAISS IndexIDMap2 + IndexFlatIP 保存可重建索引
 检索
-  → 用户问题 embedding → FAISS top-k → 返回相关块(带论文引用)
+  → 用户问题 embedding → FAISS top-5 → 返回相关块(论文标题 + 页码)
+  → 将 Top 5 段落发送给配置的 LLM,生成带 [来源N] 引用的回答
 ```
 
-> 分块粒度:标题/段落级(沿用 GUI 的块),不做按字符硬切;跨论文检索时给每块带 `paper_id` 上下文。
+> 分块粒度:标题/段落级(沿用 GUI 的块),不做按字符硬切。论文由用户在文件菜单中手动加入;索引在后台线程建立,避免阻塞 GUI。FAISS 文件损坏或 ID 不一致时从 SQLite 自动重建。
 
 ### 5.3 Agent 引擎(原生 OpenAI tools)
 
@@ -352,11 +354,12 @@ CREATE TABLE messages (
     role TEXT NOT NULL,          -- system/user/assistant/tool
     content TEXT,
     tool_calls_json TEXT,
+    metadata_json TEXT,          -- 选中段落等消息附件
     created_at TEXT NOT NULL
 );
 ```
 
-`SessionStore` 启动时创建数据库和索引;每条用户、助手或工具消息成功写入后再更新 `updated_at`。恢复会话时按 `created_at` 排序加载,再交给 Agent 引擎做上下文裁剪。
+`SessionStore` 启动时创建数据库和索引,并为旧数据库自动补充 `metadata_json`;每条用户、助手或工具消息成功写入后再更新 `updated_at`。恢复会话时按 `created_at` 排序加载,再交给 Agent 引擎做上下文裁剪。
 
 #### 5.6.3 上下文裁剪
 
@@ -365,6 +368,8 @@ CREATE TABLE messages (
 #### 5.6.4 最小交互
 
 采用三栏布局:最左侧固定显示最近会话,中间显示 PDF 原文,右侧在译文与对话间切换。会话栏不放置实体操作按钮,在该区域右键弹出新建/重命名/删除菜单。启动应用 → 点击左侧历史会话恢复 → 继续发送消息。删除会话只删除聊天记录,不删除论文库文件。
+
+选中 PDF 或译文列表中的文本块时,继续触发原有逐块翻译,并在对话输入框上方生成可移除的段落附件。发送问题时先快照该段原文、已有译文、论文标题、页码和 bbox,保存到用户消息的 `metadata_json`;本轮只使用选中段落,跳过 Top 5 RAG 和当前论文 32000 字符回退上下文。历史消息重新加载后仍显示当时引用的段落。
 
 ---
 
@@ -375,7 +380,8 @@ CREATE TABLE messages (
 | **P0** | 环境搭建 + **验证核心**:打开 PDF → 渲染 → 抽块 → 点块高亮 | 原型可运行 | ★★ | 1~2 周 |
 | **P1** | 双语展示:逐块翻译 + 右侧译文列表 | 基础阅读器 | ★ | 数天 |
 | **P2（已完成）** | 对话面板:接入 LLM + SQLite 会话持久化,"问这篇论文"跑通(无工具) | 可跨天恢复的对话阅读器 | ★★ | 1~1.5 周 |
-| **P3** | 论文库 + RAG:embedding + FAISS + 检索工具 | 论文库雏形 | ★★★ | 2~3 周 |
+| **P3（已完成）** | 论文库 + RAG:BGE-M3 + SQLite + FAISS + 跨论文引用 | 论文库雏形 | ★★★ | 2~3 周 |
+| **P3.5（已完成）** | Codex 式选中段落附件 + 翻译 + 局部问答 + 消息持久化 | 段落精读工作流 | ★★ | 数天 |
 | **P4** | 技能注册表 + Agent 工具循环:`web_search` / 总结 / 要点 / 术语表 | 完整 Agent | ★★ | 1~2 周 |
 | **P5** | Codex 风格 UI 打磨 + 设置页 + 配置持久化 | 可用成品 | ★★ | 1~2 周 |
 | **P6(可选)** | 集成 pdf2zh 导出双语 PDF | 附加导出 | — | 1 周 |
@@ -388,6 +394,7 @@ CREATE TABLE messages (
 - **P1**:右侧能看到逐段"原文→译文",翻译可配置模型。
 - **P2**:右侧对话能回答"这篇论文主要讲什么";关闭并重启应用后可从历史会话继续对话。
 - **P3**:跨论文检索能返回带引用的相关段落。
+- **P3.5**:选中任一文本块后可翻译并作为附件提问;重启后消息仍保留段落来源。
 - **P4**:agent 能自主决定调用工具完成"总结我的方向相关论文"。
 - **P5**:深色 Codex 风格界面 + 设置页可切换 DeepSeek/OpenAI。
 
@@ -406,6 +413,7 @@ CREATE TABLE messages (
 | 聊天数据库损坏或误删 | 历史会话丢失 | SQLite 开启 WAL;定期复制数据库到 `data/backups/`;删除会话前二次确认 |
 | 历史过长导致上下文超限 | 请求失败或成本升高 | 按 5.6.3 规则裁剪并持久化摘要;原始消息仍保留在数据库 |
 | 本地聊天记录包含敏感研究内容 | 隐私泄露 | 默认仅本机存储;设置页提供数据目录和“清空会话”入口;不上传聊天数据库 |
+| 外部 LLM 请求包含论文内容 | 未公开论文内容被发送到服务商 | 附加选中段落时只发送该段原文、已有译文、标题和页码;普通问答最多发送 Top 5 检索段落,当前论文未入库时可使用总计不超过 32000 字符的回退上下文;不上传原始 PDF、论文库数据库或 FAISS 索引 |
 
 ---
 
@@ -435,10 +443,10 @@ CREATE TABLE messages (
 
 ## 10. 待定问题
 
-- [ ] 论文库存储位置与目录结构(本地 `data/` 还是用户指定目录?)
-- [ ] 向量库是否需要持久化(FAISS 索引存盘,重启不重建)
+- [x] 论文库存储位置:`%LOCALAPPDATA%/AcademicAgent/`
+- [x] 向量库持久化(FAISS 索引存盘,校验失败时从 SQLite 重建)
 - [ ] 翻译触发策略(点击块时翻译 / 预加载前几页 / 全文后台翻译)
-- [ ] embedding 模型选型(中文效果优先,如 `BAAI/bge-m3`)
+- [x] embedding 模型选型:`BAAI/bge-m3` + CUDA
 - [ ] Web 搜索服务商选型(Tavily 免费额度 / DuckDuckGo 免费不稳 / SearXNG 自部署)
 - [ ] 会话保留策略(永久保存 / 按时间清理 / 用户手动清理)
 - [ ] 会话数据库备份与导出格式(JSON/Markdown)
