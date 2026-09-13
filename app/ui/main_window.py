@@ -21,10 +21,12 @@ from PyQt6.QtWidgets import (
 
 from app.core.chat_service import ChatService
 from app.core.pdf_parser import PDFParser, ParsedDocument
-from app.core.session_store import SessionStore
+from app.core.rag_engine import RagEngine
+from app.core.session_store import SessionStore, selected_passage_from_metadata
 from app.core.translator import Translator
 from app.resources import resource_path
 from app.ui.chat_panel import ChatPanel, SessionSidebar
+from app.ui.paper_library_dialog import PaperLibraryDialog
 from app.ui.pdf_viewer import PDFPageView
 from app.ui.translation_panel import TranslationPanel
 
@@ -63,29 +65,85 @@ class TranslationWorker(QObject):
 class ChatWorker(QObject):
     finished = pyqtSignal(str, str)
     failed = pyqtSignal(str, str)
+    MAX_PAPER_CONTEXT_CHARS = 32000
 
-    def __init__(self, chat_service: ChatService, session_id: str, messages, context: str) -> None:
+    def __init__(
+        self,
+        chat_service: ChatService,
+        rag_engine: RagEngine,
+        session_id: str,
+        messages,
+        query: str,
+        current_paper_path: str | None,
+        fallback_context: str,
+    ) -> None:
         super().__init__()
         self.chat_service = chat_service
+        self.rag_engine = rag_engine
         self.session_id = session_id
         self.messages = messages
-        self.context = context
+        self.query = query
+        self.current_paper_path = current_paper_path
+        self.fallback_context = fallback_context
 
     def run(self) -> None:
         try:
+            selected_passage = (
+                selected_passage_from_metadata(self.messages[-1].metadata)
+                if self.messages
+                else None
+            )
+            results = (
+                []
+                if selected_passage is not None
+                else self.rag_engine.search(self.query, top_k=5)
+            )
+            context = self.rag_engine.format_context(results)
+            current_is_indexed = bool(
+                selected_passage is None
+                and self.current_paper_path
+                and self.rag_engine.contains_document(self.current_paper_path)
+            )
+            if (
+                self.fallback_context
+                and selected_passage is None
+                and (not results or not current_is_indexed)
+            ):
+                context = "\n\n".join(part for part in (context, self.fallback_context) if part)
+            context = context[: self.MAX_PAPER_CONTEXT_CHARS]
             self.finished.emit(
                 self.session_id,
-                self.chat_service.answer(self.messages, self.context),
+                self.chat_service.answer(self.messages, context),
             )
         except Exception as exc:
             self.failed.emit(self.session_id, str(exc))
 
 
+class IndexWorker(QObject):
+    finished = pyqtSignal(str, str, bool, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, rag_engine: RagEngine, document: ParsedDocument) -> None:
+        super().__init__()
+        self.rag_engine = rag_engine
+        self.document = document
+
+    def run(self) -> None:
+        try:
+            paper, created = self.rag_engine.add_document(self.document)
+            self.finished.emit(paper.paper_id, paper.title, created, paper.block_count)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
+    MAX_SELECTED_PASSAGE_CHARS = 12000
+
     def __init__(
         self,
         initial_pdf: str | None = None,
         session_store: SessionStore | None = None,
+        rag_engine: RagEngine | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Academic Agent")
@@ -98,9 +156,13 @@ class MainWindow(QMainWindow):
         self.translator = Translator()
         self.chat_service = ChatService(self.translator.client, self.translator.model)
         self.session_store = session_store or SessionStore()
+        self.rag_engine = rag_engine or RagEngine()
         self.current_session_id: str | None = None
+        self._selected_passage: dict[str, object] | None = None
         self._chat_thread: QThread | None = None
         self._chat_worker: ChatWorker | None = None
+        self._index_thread: QThread | None = None
+        self._index_worker: IndexWorker | None = None
         self._translation_threads: dict[tuple[int, int, int], QThread] = {}
         self._translation_workers: dict[tuple[int, int, int], TranslationWorker] = {}
         self._inflight: set[tuple[int, int, int]] = set()
@@ -147,10 +209,18 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self.load_pdf(initial_pdf))
 
     def _build_ui(self) -> None:
+        file_menu = self.menuBar().addMenu("文件")
         open_action = QAction("打开 PDF", self)
         open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self.open_pdf)
-        self.menuBar().addMenu("文件").addAction(open_action)
+        file_menu.addAction(open_action)
+        self.add_to_library_action = QAction("将当前论文加入论文库", self)
+        self.add_to_library_action.setEnabled(False)
+        self.add_to_library_action.triggered.connect(self.add_current_to_library)
+        file_menu.addAction(self.add_to_library_action)
+        self.manage_library_action = QAction("管理论文库", self)
+        self.manage_library_action.triggered.connect(self.show_paper_library)
+        file_menu.addAction(self.manage_library_action)
 
         page_controls = QHBoxLayout()
         page_controls.setContentsMargins(0, 0, 0, 0)
@@ -187,13 +257,19 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow, QWidget { background: #202328; color: #e6e9ef; }
-            QListWidget, QSpinBox { background: #17191d; border: 1px solid #343a46; }
+            QListWidget { background: #17191d; alternate-background-color: #1d2025; border: 1px solid #343a46; }
+            QSpinBox { background: #17191d; border: 1px solid #343a46; }
             QListWidget::item { padding: 0px; border-bottom: 1px solid #2d323c; }
             QListWidget::item:selected { background: #394455; }
             QLabel#sidebarTitle { font-size: 18px; font-weight: 600; padding: 4px 2px 8px 2px; }
             QTextBrowser, QTextEdit { background: #17191d; border: 1px solid #343a46; padding: 8px; }
             QPushButton { background: #303642; border: 1px solid #454e5e; padding: 6px 12px; }
             QPushButton:hover { background: #3d4758; }
+            QWidget#passageAttachment { background: #292f38; border: 1px solid #465064; border-radius: 4px; }
+            QWidget#passageAttachment QLabel { background: transparent; border: none; }
+            QLabel#passageAttachmentTitle { font-weight: 600; }
+            QLabel#passageAttachmentPreview { color: #aeb8c8; }
+            QPushButton#clearPassageButton { padding: 0px; font-size: 18px; }
             """
         )
 
@@ -216,6 +292,7 @@ class MainWindow(QMainWindow):
         self.session_sidebar.renameSessionRequested.connect(self.rename_session)
         self.session_sidebar.deleteSessionRequested.connect(self.delete_session)
         self.chat_panel.messageSubmitted.connect(self.send_chat_message)
+        self.chat_panel.selectedPassageCleared.connect(self.clear_selected_passage)
 
     def open_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "打开 PDF", "", "PDF 文件 (*.pdf)")
@@ -230,9 +307,11 @@ class MainWindow(QMainWindow):
             return
         if self.document:
             self.document.close()
+        self.clear_selected_passage()
         self._document_generation += 1
         self.document = parsed
         self.current_page = 0
+        self.add_to_library_action.setEnabled(True)
         if self.current_session_id:
             self.session_store.set_paper(self.current_session_id, str(parsed.path))
             self._refresh_sessions(self.current_session_id)
@@ -240,6 +319,83 @@ class MainWindow(QMainWindow):
         self.translation_panel.set_blocks(parsed.pages[0].blocks if parsed.pages else [])
         self.show_page(0)
         self.statusBar().showMessage(f"已打开：{parsed.path.name}")
+
+    def add_current_to_library(self) -> None:
+        if not self.document or (self._index_thread and self._index_thread.isRunning()):
+            return
+        if self._chat_thread and self._chat_thread.isRunning():
+            self.statusBar().showMessage("请等待当前回答完成后再建立论文索引。")
+            return
+        thread = QThread(self)
+        worker = IndexWorker(self.rag_engine, self.document)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._index_finished)
+        worker.failed.connect(self._index_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._release_index_worker)
+        self._index_thread = thread
+        self._index_worker = worker
+        self.add_to_library_action.setEnabled(False)
+        self.chat_panel.set_busy(True, "正在建立论文索引，首次使用将下载 BGE-M3…")
+        self.session_sidebar.set_busy(True)
+        self.statusBar().showMessage("正在加载 BGE-M3 并建立论文索引…")
+        thread.start()
+
+    def _index_finished(
+        self, _paper_id: str, title: str, created: bool, block_count: int
+    ) -> None:
+        self.add_to_library_action.setEnabled(self.document is not None)
+        self.chat_panel.set_busy(False)
+        self.session_sidebar.set_busy(False)
+        if created:
+            message = f"已加入论文库：{title}（{block_count} 个文本块）"
+        else:
+            message = f"论文已在库中：{title}"
+        self.statusBar().showMessage(message)
+
+    def _index_failed(self, message: str) -> None:
+        self.add_to_library_action.setEnabled(self.document is not None)
+        self.chat_panel.set_busy(False, message)
+        self.session_sidebar.set_busy(False)
+        self.statusBar().showMessage(f"论文入库失败：{message}")
+
+    def _release_index_worker(self) -> None:
+        self._index_worker = None
+        self._index_thread = None
+
+    def show_paper_library(self) -> None:
+        dialog = PaperLibraryDialog(self)
+        dialog.set_papers(self.rag_engine.list_papers())
+        dialog.openPaperRequested.connect(lambda path: self._open_library_paper(dialog, path))
+        dialog.removePaperRequested.connect(
+            lambda paper_id: self._remove_library_paper(dialog, paper_id)
+        )
+        dialog.exec()
+
+    def _open_library_paper(self, dialog: PaperLibraryDialog, path: str) -> None:
+        paper_path = Path(path)
+        if not paper_path.exists():
+            QMessageBox.warning(self, "文件不存在", "论文文件已移动或删除。")
+            return
+        dialog.accept()
+        self.load_pdf(paper_path)
+
+    def _remove_library_paper(
+        self, dialog: PaperLibraryDialog, paper_id: str
+    ) -> None:
+        answer = QMessageBox.question(
+            self,
+            "移出论文库",
+            "确定从论文库移除该论文吗？原始 PDF 文件不会被删除。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.rag_engine.remove_paper(paper_id)
+        dialog.set_papers(self.rag_engine.list_papers())
+        self.statusBar().showMessage("论文已移出论文库")
 
     def show_page(self, page_number: int) -> None:
         if not self.document or not self.document.pages:
@@ -294,6 +450,17 @@ class MainWindow(QMainWindow):
         self.pdf_view.set_selected(index)
         self.translation_panel.select_block(index)
         block = blocks[index]
+        self._selected_passage = {
+            "paper_path": str(self.document.path),
+            "paper_title": self.document.path.stem,
+            "page": self.current_page + 1,
+            "block_index": index,
+            "block_order": block.order,
+            "bbox": list(block.bbox),
+            "text": block.text.strip()[: self.MAX_SELECTED_PASSAGE_CHARS],
+            "translation": block.translation,
+        }
+        self.chat_panel.set_selected_passage(self._selected_passage)
         thread_key = (self._document_generation, self.current_page, index)
         if block.translation or block.kind == "formula" or thread_key in self._inflight:
             if block.kind == "formula" and not block.translation:
@@ -340,6 +507,14 @@ class MainWindow(QMainWindow):
             return
         block = self.document.pages[page_number].blocks[index]
         block.translation = translation
+        if (
+            self._selected_passage
+            and self._selected_passage.get("paper_path") == str(self.document.path)
+            and self._selected_passage.get("page") == page_number + 1
+            and self._selected_passage.get("block_index") == index
+        ):
+            self._selected_passage["translation"] = translation
+            self.chat_panel.set_selected_passage(self._selected_passage)
         if page_number == self.current_page:
             self.translation_panel.update_block(index, block)
             self.statusBar().showMessage("翻译完成")
@@ -381,6 +556,8 @@ class MainWindow(QMainWindow):
         except KeyError:
             self._refresh_sessions()
             return
+        if session_id != self.current_session_id:
+            self.clear_selected_passage()
         self.current_session_id = session_id
         self.chat_panel.show_messages(self.session_store.get_messages(session_id))
         if session.paper_id:
@@ -416,29 +593,49 @@ class MainWindow(QMainWindow):
         self._refresh_sessions()
 
     def send_chat_message(self, text: str) -> None:
+        if self._index_thread and self._index_thread.isRunning():
+            self.statusBar().showMessage("请等待论文索引完成后再提问。")
+            return
         if self._chat_thread and self._chat_thread.isRunning():
             return
+        selected_passage = (
+            dict(self._selected_passage) if self._selected_passage else None
+        )
         if not self.current_session_id:
             self.new_session()
         if not self.current_session_id:
             return
         session_id = self.current_session_id
         existing_messages = self.session_store.get_messages(session_id)
-        self.session_store.add_message(session_id, "user", text)
+        metadata = (
+            {"selected_passage": selected_passage}
+            if selected_passage
+            else None
+        )
+        self.session_store.add_message(
+            session_id,
+            "user",
+            text,
+            metadata=metadata,
+        )
+        self.clear_selected_passage()
         if not existing_messages:
             self.session_store.rename_session(session_id, text[:40])
         messages = self.session_store.get_messages(session_id)
         self.chat_panel.clear_input()
         self.chat_panel.show_messages(messages)
-        self.chat_panel.set_busy(True, "正在思考…")
+        self.chat_panel.set_busy(True, "正在检索论文库并思考…")
         self.session_sidebar.set_busy(True)
         self._refresh_sessions(session_id)
 
         thread = QThread(self)
         worker = ChatWorker(
             self.chat_service,
+            self.rag_engine,
             session_id,
             messages,
+            text,
+            str(self.document.path) if self.document else None,
             self._paper_context(),
         )
         worker.moveToThread(thread)
@@ -453,6 +650,10 @@ class MainWindow(QMainWindow):
         self._chat_worker = worker
         thread.start()
 
+    def clear_selected_passage(self) -> None:
+        self._selected_passage = None
+        self.chat_panel.set_selected_passage(None)
+
     def _paper_context(self, max_chars: int = 32000) -> str:
         if not self.document:
             return ""
@@ -462,7 +663,7 @@ class MainWindow(QMainWindow):
             page_text = "\n".join(
                 block.text for block in page.blocks if block.kind != "formula"
             )
-            chunk = f"[第 {page.number + 1} 页]\n{page_text}\n"
+            chunk = f"[当前论文，第 {page.number + 1} 页]\n{page_text}\n"
             if parts and used_chars + len(chunk) > max_chars:
                 break
             parts.append(chunk[: max_chars - used_chars])
@@ -492,6 +693,10 @@ class MainWindow(QMainWindow):
         self._chat_thread = None
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._index_thread and self._index_thread.isRunning():
+            self.statusBar().showMessage("论文索引仍在进行，请等待完成后再关闭。")
+            event.ignore()
+            return
         if self._chat_thread and self._chat_thread.isRunning():
             self.chat_panel.set_busy(True, "模型仍在响应，请等待完成后再关闭。")
             self.session_sidebar.set_busy(True)
@@ -503,4 +708,5 @@ class MainWindow(QMainWindow):
         if self.document:
             self.document.close()
         self.session_store.close()
+        self.rag_engine.close()
         event.accept()
