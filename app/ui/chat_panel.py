@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -8,13 +10,18 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from app.core.session_store import Message, Session
+from app.core.session_store import (
+    Message,
+    Session,
+    selected_passage_from_metadata,
+)
 
 
 class SessionSidebar(QWidget):
@@ -89,8 +96,39 @@ class SessionSidebar(QWidget):
             self.sessionSelected.emit(current.data(Qt.ItemDataRole.UserRole))
 
 
+class ElidedLabel(QLabel):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(self.fontMetrics().height())
+        self.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+
+    def set_full_text(self, text: str) -> None:
+        self._full_text = text
+        self._update_elided_text()
+
+    def _update_elided_text(self) -> None:
+        available_width = max(0, self.contentsRect().width())
+        elided = self.fontMetrics().elidedText(
+            self._full_text,
+            Qt.TextElideMode.ElideRight,
+            available_width,
+        )
+        if elided != self.text():
+            super().setText(elided)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._update_elided_text()
+
+
 class ChatPanel(QWidget):
     messageSubmitted = pyqtSignal(str)
+    selectedPassageCleared = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -102,11 +140,32 @@ class ChatPanel(QWidget):
         self.send_button = QPushButton("发送")
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
+        self.passage_attachment = QWidget()
+        self.passage_attachment.setObjectName("passageAttachment")
+        self.passage_title = ElidedLabel()
+        self.passage_title.setObjectName("passageAttachmentTitle")
+        self.passage_preview = ElidedLabel()
+        self.passage_preview.setObjectName("passageAttachmentPreview")
+        self.clear_passage_button = QPushButton("×")
+        self.clear_passage_button.setObjectName("clearPassageButton")
+        self.clear_passage_button.setFixedSize(28, 28)
+        self.clear_passage_button.setToolTip("移除选中段落")
 
         self._build_ui()
         self._connect_signals()
 
     def _build_ui(self) -> None:
+        passage_text = QVBoxLayout()
+        passage_text.setContentsMargins(0, 0, 0, 0)
+        passage_text.setSpacing(2)
+        passage_text.addWidget(self.passage_title)
+        passage_text.addWidget(self.passage_preview)
+        passage_layout = QHBoxLayout(self.passage_attachment)
+        passage_layout.setContentsMargins(10, 7, 7, 7)
+        passage_layout.addLayout(passage_text, 1)
+        passage_layout.addWidget(self.clear_passage_button)
+        self.passage_attachment.hide()
+
         compose = QHBoxLayout()
         compose.addWidget(self.input, 1)
         compose.addWidget(self.send_button)
@@ -115,10 +174,12 @@ class ChatPanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(self.messages, 1)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.passage_attachment)
         layout.addLayout(compose)
 
     def _connect_signals(self) -> None:
         self.send_button.clicked.connect(self._submit)
+        self.clear_passage_button.clicked.connect(self.selectedPassageCleared.emit)
 
     def show_messages(self, messages: list[Message]) -> None:
         parts = []
@@ -127,7 +188,17 @@ class ChatPanel(QWidget):
             if not message.content or message.role == "tool":
                 continue
             label = labels.get(message.role, message.role)
-            safe_content = message.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            passage = selected_passage_from_metadata(message.metadata)
+            if passage is not None:
+                title = html.escape(str(passage.get("paper_title") or "当前论文"))
+                page = html.escape(str(passage.get("page") or "未知"))
+                preview = self._preview(str(passage["text"]), 120)
+                parts.append(
+                    "<p style='color:#aeb8c8'>"
+                    f"<b>选中段落 · {title} · 第 {page} 页</b><br>"
+                    f"{html.escape(preview)}</p>"
+                )
+            safe_content = html.escape(message.content)
             parts.append(f"<p><b>{label}</b><br>{safe_content.replace(chr(10), '<br>')}</p>")
         self.messages.setHtml("".join(parts))
         self.messages.verticalScrollBar().setValue(self.messages.verticalScrollBar().maximum())
@@ -139,6 +210,26 @@ class ChatPanel(QWidget):
 
     def clear_input(self) -> None:
         self.input.clear()
+
+    def set_selected_passage(self, passage: dict[str, object] | None) -> None:
+        if passage is None:
+            self.passage_attachment.hide()
+            self.input.setPlaceholderText("询问当前论文…")
+            return
+        title = str(passage.get("paper_title") or "当前论文")
+        page = passage.get("page") or "未知"
+        self.passage_title.set_full_text(f"选中段落 · {title} · 第 {page} 页")
+        self.passage_title.setToolTip(title)
+        passage_text = str(passage["text"])
+        self.passage_preview.set_full_text(" ".join(passage_text.split()))
+        self.passage_preview.setToolTip(passage_text)
+        self.passage_attachment.show()
+        self.input.setPlaceholderText("询问选中段落…")
+
+    @staticmethod
+    def _preview(text: str, limit: int) -> str:
+        normalized = " ".join(text.split())
+        return normalized if len(normalized) <= limit else normalized[:limit] + "..."
 
     def _submit(self) -> None:
         text = self.input.toPlainText().strip()
