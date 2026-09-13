@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.paper_repo import PaperRecord
+from app.ui.icons import app_icon
 
 
 class PaperLibraryDialog(QDialog):
@@ -28,7 +29,9 @@ class PaperLibraryDialog(QDialog):
         self.paper_list.setAlternatingRowColors(True)
         self.summary_label = QLabel("共 0 篇论文")
         self.open_button = QPushButton("打开论文")
+        self.open_button.setIcon(app_icon("fa5s.folder-open"))
         self.remove_button = QPushButton("移出论文库")
+        self.remove_button.setIcon(app_icon("fa5s.trash-alt", "#e58b86"))
         close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close_buttons.rejected.connect(self.reject)
 
@@ -85,4 +88,3 @@ class PaperLibraryDialog(QDialog):
         paper_id = self.current_paper_id()
         if paper_id:
             self.removePaperRequested.emit(paper_id)
-
