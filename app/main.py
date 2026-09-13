@@ -23,6 +23,8 @@ def main() -> int:
 
     application = QApplication(sys.argv)
     application.setApplicationName("AcademicAgent")
+    application.setOrganizationName("AcademicAgent")
+    application.setStyle("Fusion")
     window = MainWindow(args.pdf)
     window.show()
     return application.exec()
