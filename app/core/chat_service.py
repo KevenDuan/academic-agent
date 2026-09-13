@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from app.core.session_store import Message
+from app.core.session_store import Message, selected_passage_from_metadata
 
 
 class ChatNotConfigured(RuntimeError):
@@ -47,9 +47,11 @@ class ChatService:
             {
                 "role": "system",
                 "content": (
-                    "你是科研论文阅读助手。请优先依据下面的论文原文回答，"
-                    "信息不足时明确说明，不要编造。使用简体中文。\n\n"
-                    f"论文原文：\n{paper_context or '当前未打开论文。'}"
+                    "你是科研论文阅读助手。请优先依据下面提供的论文资料回答，"
+                    "信息不足时明确说明，不要编造。使用简体中文。资料中若有"
+                    "[来源N]标记，请在相关结论后保留该标记作为引用。用户消息中"
+                    "若附有[选中段落]，优先依据该段回答，并使用[选中段落]引用。\n\n"
+                    f"论文资料：\n{paper_context or '当前没有可用论文资料。'}"
                 ),
             }
         ]
@@ -73,17 +75,38 @@ class ChatService:
         Returns:
             list[dict[str, str]]: 最近的用户和助手消息列表，每条消息包含角色和内容
         """
-        selected: list[Message] = []
+        selected: list[tuple[Message, str]] = []
         used_chars = 0
         for message in reversed(messages):
             if message.role not in {"user", "assistant"} or not message.content: # 系统消息和空消息不考虑
                 continue
-            if selected and used_chars + len(message.content) > self.max_history_chars: # 超过最大字符数，停止添加
+            content = self._message_content(message)
+            if selected and used_chars + len(content) > self.max_history_chars: # 超过最大字符数，停止添加
                 break
-            selected.append(message)
-            used_chars += len(message.content)
+            selected.append((message, content))
+            used_chars += len(content)
         return [
-            {"role": message.role, "content": message.content or ""}
-            for message in reversed(selected)
+            {"role": message.role, "content": content}
+            for message, content in reversed(selected)
         ]
 
+    @staticmethod
+    def _message_content(message: Message) -> str:
+        content = message.content or ""
+        if message.role != "user":
+            return content
+        passage = selected_passage_from_metadata(message.metadata)
+        if passage is None:
+            return content
+        title = passage.get("paper_title") or "当前论文"
+        page = passage.get("page") or "未知"
+        translation = passage.get("translation")
+        sections = [
+            "[选中段落]",
+            f"论文：{title}，第 {page} 页",
+            f"原文：\n{passage['text']}",
+        ]
+        if translation:
+            sections.append(f"中文译文：\n{translation}")
+        sections.append(f"用户问题：\n{content}")
+        return "\n\n".join(sections)
