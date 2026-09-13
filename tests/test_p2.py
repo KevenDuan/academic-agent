@@ -95,6 +95,7 @@ class P2Tests(unittest.TestCase):
             self.assertEqual(answer, "论文提出了 U-Net。")
             self.assertEqual(request["model"], "test-model")
             self.assertIn("U-Net", request["messages"][0]["content"])
+            self.assertIn("[来源N]", request["messages"][0]["content"])
             self.assertEqual(request["messages"][-1]["role"], "user")
         finally:
             store.close()
