@@ -18,13 +18,25 @@ persistent conversations, and tool-using LLM workflows in a PyQt6 desktop applic
 
 ## Current status
 
-P0 through P3 are implemented: open a digital PDF, render pages, extract text
-blocks with PDF coordinates, request block-level Chinese translations, and ask
-an OpenAI-compatible model questions across a local paper library. Chat sessions
-and paper metadata are stored locally in SQLite; BGE-M3 and FAISS provide
-GPU-accelerated multilingual retrieval with title and page citations.
+P0 through P5 are implemented: open a digital PDF, render pages, extract text
+blocks with PDF coordinates, request block-level Chinese translations, ask
+focused questions about a selected passage, and use an OpenAI-compatible agent
+to call local-paper and web-search tools. Chat sessions, tool calls, and paper
+metadata are stored locally in SQLite; BGE-M3 and FAISS provide GPU-accelerated
+multilingual retrieval with title and page citations.
 Selecting a PDF block also creates a removable chat attachment for focused
 questions about that passage.
+
+## Model settings
+
+Open `应用 → 设置` to switch between DeepSeek, OpenAI, or another
+OpenAI-compatible endpoint. Model ID, Base URL, API key, request timeout, and
+Tavily key can be edited without restarting the application. The saved values
+take precedence over `.env` on the next launch and are stored locally in
+`%LOCALAPPDATA%\AcademicAgent\settings.json`.
+
+The API keys in this file are local plaintext credentials. Keep the file out of
+version control and restrict access to your Windows account.
 
 ## Run locally
 
@@ -67,6 +79,24 @@ the library and sends their text, paper title, and page number to the configured
 LLM. Answers are prompted to retain `[来源N]` citations. Paper metadata and
 embeddings are stored in `%LOCALAPPDATA%/AcademicAgent/papers.db`; the rebuildable
 FAISS cache is `%LOCALAPPDATA%/AcademicAgent/papers.faiss`.
+
+## Agent tools (P4)
+
+The native tool loop loads skills from `app/skills/<name>/SKILL.md` and
+`skill.py` at startup. The bundled tools are `search_papers`,
+`get_paper_summary`, `extract_key_points`, `translate_text`, and `web_search`.
+The model can call several tools in one request, with a six-round safety limit;
+tool results are saved in the local session database. `web_search` requires
+`TVLY_API_KEY` (or `TAVILY_API_KEY`) in `.env`.
+
+## Desktop interface (P5)
+
+The production interface uses a neutral graphite theme, a compact icon toolbar,
+and a stable three-column workspace inspired by Codex. PDF controls, paper
+library actions, model settings, selected-passage context, and conversation
+states share one visual system. Conversation management remains available only
+from the left sidebar context menu. Use the first toolbar button or `Ctrl+B` to
+collapse and restore the recent-conversation sidebar.
 
 Run the local checks with:
 
