@@ -132,6 +132,34 @@ class RagEngine:
         with self._lock:
             return self.repository.list_papers()
 
+    def paper_evidence(self, identifier: str, max_chars: int = 24000) -> str:
+        identifier = identifier.strip()
+        if not identifier:
+            return "论文 ID、标题或路径不能为空。"
+        with self._lock:
+            papers = self.repository.list_papers()
+            paper = next(
+                (
+                    item
+                    for item in papers
+                    if identifier in {item.paper_id, item.title, item.file_path}
+                    or identifier.lower() in item.title.lower()
+                ),
+                None,
+            )
+            if paper is None:
+                return f"论文库中没有找到：{identifier}"
+            blocks = self.repository.get_paper_blocks(paper.paper_id)
+            parts = [f"论文：{paper.title}（paper_id={paper.paper_id}）"]
+            used = len(parts[0])
+            for block in blocks:
+                chunk = f"\n[第 {block.page + 1} 页]\n{block.text}\n"
+                if used + len(chunk) > max_chars:
+                    break
+                parts.append(chunk)
+                used += len(chunk)
+            return "".join(parts)
+
     def contains_document(self, path: str | Path) -> bool:
         with self._lock:
             paper_id = self.repository.file_hash(path)
