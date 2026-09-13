@@ -4,6 +4,7 @@ import html
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -22,6 +23,7 @@ from app.core.session_store import (
     Session,
     selected_passage_from_metadata,
 )
+from app.ui.icons import app_icon
 
 
 class SessionSidebar(QWidget):
@@ -32,16 +34,20 @@ class SessionSidebar(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("sessionSidebar")
         self.setMinimumWidth(190)
         self.setMaximumWidth(320)
-        title = QLabel("对话")
-        title.setObjectName("sidebarTitle")
+        title = QLabel("Academic Agent")
+        title.setObjectName("brandTitle")
+        section = QLabel("最近对话")
+        section.setObjectName("sectionLabel")
         self.session_list = QListWidget()
         self._busy = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.addWidget(title)
+        layout.addWidget(section)
         layout.addWidget(self.session_list, 1)
 
         self.session_list.currentItemChanged.connect(self._session_changed)
@@ -133,21 +139,31 @@ class ChatPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.messages = QTextBrowser()
+        self.messages.setObjectName("chatMessages")
         self.messages.setOpenExternalLinks(True)
         self.input = QTextEdit()
-        self.input.setPlaceholderText("询问当前论文…")
-        self.input.setFixedHeight(88)
-        self.send_button = QPushButton("发送")
+        self.input.setObjectName("chatInput")
+        self.input.setPlaceholderText("向 Academic Agent 提问…")
+        self.input.setFixedHeight(82)
+        self.send_button = QPushButton()
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setIcon(app_icon("fa5s.paper-plane", "#07130d"))
+        self.send_button.setFixedSize(36, 36)
+        self.send_button.setToolTip("发送")
         self.status_label = QLabel()
+        self.status_label.setObjectName("composerStatus")
         self.status_label.setWordWrap(True)
+        self.composer = QFrame()
+        self.composer.setObjectName("chatComposer")
         self.passage_attachment = QWidget()
         self.passage_attachment.setObjectName("passageAttachment")
         self.passage_title = ElidedLabel()
         self.passage_title.setObjectName("passageAttachmentTitle")
         self.passage_preview = ElidedLabel()
         self.passage_preview.setObjectName("passageAttachmentPreview")
-        self.clear_passage_button = QPushButton("×")
+        self.clear_passage_button = QPushButton()
         self.clear_passage_button.setObjectName("clearPassageButton")
+        self.clear_passage_button.setIcon(app_icon("fa5s.times"))
         self.clear_passage_button.setFixedSize(28, 28)
         self.clear_passage_button.setToolTip("移除选中段落")
 
@@ -166,23 +182,37 @@ class ChatPanel(QWidget):
         passage_layout.addWidget(self.clear_passage_button)
         self.passage_attachment.hide()
 
-        compose = QHBoxLayout()
-        compose.addWidget(self.input, 1)
-        compose.addWidget(self.send_button)
+        composer_footer = QHBoxLayout()
+        composer_footer.setContentsMargins(0, 0, 0, 0)
+        composer_footer.addWidget(self.status_label, 1)
+        composer_footer.addWidget(self.send_button)
+        composer_layout = QVBoxLayout(self.composer)
+        composer_layout.setContentsMargins(11, 8, 9, 9)
+        composer_layout.setSpacing(4)
+        composer_layout.addWidget(self.input)
+        composer_layout.addLayout(composer_footer)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
         layout.addWidget(self.messages, 1)
-        layout.addWidget(self.status_label)
         layout.addWidget(self.passage_attachment)
-        layout.addLayout(compose)
+        layout.addWidget(self.composer)
 
     def _connect_signals(self) -> None:
         self.send_button.clicked.connect(self._submit)
         self.clear_passage_button.clicked.connect(self.selectedPassageCleared.emit)
 
     def show_messages(self, messages: list[Message]) -> None:
-        parts = []
+        parts = [
+            "<style>"
+            "body { color: #eef0ee; }"
+            ".role { color: #a8afab; font-size: 11px; font-weight: 600; margin-top: 14px; }"
+            ".message { margin: 4px 0 18px 0; line-height: 1.5; }"
+            ".passage { color: #c0d8ca; background: #35433b; border-left: 2px solid #8ed3a6; "
+            "padding: 7px 9px; margin: 5px 0 8px 0; }"
+            "</style>"
+        ]
         labels = {"user": "你", "assistant": "Academic Agent", "system": "系统"}
         for message in messages:
             if not message.content or message.role == "tool":
@@ -194,12 +224,15 @@ class ChatPanel(QWidget):
                 page = html.escape(str(passage.get("page") or "未知"))
                 preview = self._preview(str(passage["text"]), 120)
                 parts.append(
-                    "<p style='color:#aeb8c8'>"
+                    "<div class='passage'>"
                     f"<b>选中段落 · {title} · 第 {page} 页</b><br>"
-                    f"{html.escape(preview)}</p>"
+                    f"{html.escape(preview)}</div>"
                 )
             safe_content = html.escape(message.content)
-            parts.append(f"<p><b>{label}</b><br>{safe_content.replace(chr(10), '<br>')}</p>")
+            parts.append(
+                f"<div class='role'>{label}</div>"
+                f"<div class='message'>{safe_content.replace(chr(10), '<br>')}</div>"
+            )
         self.messages.setHtml("".join(parts))
         self.messages.verticalScrollBar().setValue(self.messages.verticalScrollBar().maximum())
 
@@ -214,7 +247,7 @@ class ChatPanel(QWidget):
     def set_selected_passage(self, passage: dict[str, object] | None) -> None:
         if passage is None:
             self.passage_attachment.hide()
-            self.input.setPlaceholderText("询问当前论文…")
+            self.input.setPlaceholderText("向 Academic Agent 提问…")
             return
         title = str(passage.get("paper_title") or "当前论文")
         page = passage.get("page") or "未知"
