@@ -117,12 +117,17 @@ class P5Tests(unittest.TestCase):
             self.assertEqual(window.workspace_splitter.count(), 3)
             self.assertIs(window.workspace_splitter.widget(0), window.session_sidebar)
             self.assertIs(window.workspace_splitter.widget(2), window.right_tabs)
+            self.assertEqual(window.view_mode_combo.count(), 3)
+            self.assertEqual(window.view_mode_combo.currentData(), "fit_width")
+            self.assertFalse(window.previous_button.isEnabled())
+            self.assertFalse(window.next_button.isEnabled())
         finally:
             window.close()
 
     def test_sidebar_keeps_entity_actions_in_context_menu_only(self):
         window = self._window()
         try:
+            self.assertEqual(window.session_sidebar.session_list.objectName(), "sessionList")
             self.assertEqual(window.session_sidebar.findChildren(QPushButton), [])
             action_names = {
                 action.text() for action in window.session_sidebar._create_context_menu().actions()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import threading
 from dataclasses import dataclass
@@ -56,6 +57,19 @@ class BgeM3Embedder:
         )
         return np.asarray(vectors, dtype=np.float32)
 
+    def close(self) -> None:
+        if self._model is None:
+            return
+        self._model = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -83,6 +97,7 @@ class RagEngine:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self._index = None
         self._lock = threading.RLock()
+        self._closed = False
 
     def add_document(self, document: ParsedDocument) -> tuple[PaperRecord, bool]:
         with self._lock:
@@ -193,7 +208,7 @@ class RagEngine:
         return "\n\n".join(sections)
 
     def _ensure_index(self):
-        ids, _vectors = self.repository.load_embeddings()
+        ids = self.repository.load_embedding_ids()
         if self._index is not None and self._valid_index(self._index, ids):
             return self._index
         if self.index_path.exists():
@@ -240,4 +255,11 @@ class RagEngine:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._index = None
+            close_embedder = getattr(self.embedder, "close", None)
+            if callable(close_embedder):
+                close_embedder()
             self.repository.close()
+            self._closed = True

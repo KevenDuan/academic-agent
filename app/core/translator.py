@@ -104,3 +104,13 @@ class Translator:
         if not content:
             raise RuntimeError("模型返回了空译文。")
         return content.strip()
+
+    def close(self) -> None:
+        client = self.client
+        self.client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass

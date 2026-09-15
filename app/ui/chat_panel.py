@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 
+from markdown_it import MarkdownIt
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame,
@@ -26,6 +27,12 @@ from app.core.session_store import (
 from app.ui.icons import app_icon
 
 
+_MARKDOWN = MarkdownIt(
+    "commonmark",
+    {"html": False, "linkify": False, "typographer": False},
+).enable(["table", "strikethrough"])
+
+
 class SessionSidebar(QWidget):
     sessionSelected = pyqtSignal(str)
     newSessionRequested = pyqtSignal()
@@ -42,6 +49,7 @@ class SessionSidebar(QWidget):
         section = QLabel("最近对话")
         section.setObjectName("sectionLabel")
         self.session_list = QListWidget()
+        self.session_list.setObjectName("sessionList")
         self._busy = False
 
         layout = QVBoxLayout(self)
@@ -206,35 +214,71 @@ class ChatPanel(QWidget):
     def show_messages(self, messages: list[Message]) -> None:
         parts = [
             "<style>"
-            "body { color: #eef0ee; }"
-            ".role { color: #a8afab; font-size: 11px; font-weight: 600; margin-top: 14px; }"
-            ".message { margin: 4px 0 18px 0; line-height: 1.5; }"
-            ".passage { color: #c0d8ca; background: #35433b; border-left: 2px solid #8ed3a6; "
-            "padding: 7px 9px; margin: 5px 0 8px 0; }"
+            "body { color: #eef0ee; margin: 0; }"
+            "table.turn { margin: 6px 0 16px 0; }"
+            "td.role { color: #a8afab; font-size: 11px; font-weight: 600; padding: 0 3px 5px 3px; }"
+            "td.user-bubble { color: #f1f5f2; background: #405047; border: 1px solid #5d7366; "
+            "padding: 10px 12px; }"
+            "td.assistant-bubble { color: #eef0ee; background: #36383a; border: 1px solid #4c4f51; "
+            "padding: 10px 12px; }"
+            ".passage { color: #c9ddd1; background: #35433b; border-left: 2px solid #8ed3a6; "
+            "padding: 7px 9px; margin: 0 0 9px 0; }"
+            "p { margin: 0 0 8px 0; line-height: 1.5; }"
+            "h1 { font-size: 18px; margin: 4px 0 9px 0; }"
+            "h2 { font-size: 16px; margin: 4px 0 8px 0; }"
+            "h3 { font-size: 14px; margin: 3px 0 7px 0; }"
+            "pre { color: #e8ece9; background: #26282a; border: 1px solid #505355; "
+            "padding: 8px; margin: 7px 0; white-space: pre-wrap; }"
+            "code { color: #d7eadf; background: #2a2c2e; font-family: Consolas, monospace; }"
+            "blockquote { color: #c2cac5; border-left: 3px solid #78837d; margin: 7px 0; padding-left: 9px; }"
+            "th { background: #2a2c2e; padding: 5px; }"
+            "td { padding: 5px; }"
+            "a { color: #9bdcb1; }"
             "</style>"
         ]
-        labels = {"user": "你", "assistant": "Academic Agent", "system": "系统"}
         for message in messages:
             if not message.content or message.role == "tool":
                 continue
-            label = labels.get(message.role, message.role)
-            passage = selected_passage_from_metadata(message.metadata)
-            if passage is not None:
-                title = html.escape(str(passage.get("paper_title") or "当前论文"))
-                page = html.escape(str(passage.get("page") or "未知"))
-                preview = self._preview(str(passage["text"]), 120)
-                parts.append(
-                    "<div class='passage'>"
-                    f"<b>选中段落 · {title} · 第 {page} 页</b><br>"
-                    f"{html.escape(preview)}</div>"
-                )
-            safe_content = html.escape(message.content)
-            parts.append(
-                f"<div class='role'>{label}</div>"
-                f"<div class='message'>{safe_content.replace(chr(10), '<br>')}</div>"
-            )
+            parts.append(self._render_turn(message))
         self.messages.setHtml("".join(parts))
         self.messages.verticalScrollBar().setValue(self.messages.verticalScrollBar().maximum())
+
+    @classmethod
+    def _render_turn(cls, message: Message) -> str:
+        is_user = message.role == "user"
+        label = "你" if is_user else "Academic Agent" if message.role == "assistant" else "系统"
+        bubble_class = "user-bubble" if is_user else "assistant-bubble"
+        content = cls._render_markdown(message.content or "")
+        passage_html = cls._render_passage(message)
+        bubble = f"<td class='{bubble_class}'>{passage_html}{content}</td>"
+        if is_user:
+            role_row = f"<tr><td width='16%'></td><td class='role' align='right'>{label}</td></tr>"
+            bubble_row = f"<tr><td width='16%'></td>{bubble}</tr>"
+        else:
+            role_row = f"<tr><td class='role' align='left'>{label}</td><td width='8%'></td></tr>"
+            bubble_row = f"<tr>{bubble}<td width='8%'></td></tr>"
+        return (
+            "<table class='turn' width='100%' cellspacing='0' cellpadding='0'>"
+            f"{role_row}{bubble_row}</table>"
+        )
+
+    @staticmethod
+    def _render_markdown(text: str) -> str:
+        return _MARKDOWN.render(text)
+
+    @classmethod
+    def _render_passage(cls, message: Message) -> str:
+        passage = selected_passage_from_metadata(message.metadata)
+        if passage is None:
+            return ""
+        title = html.escape(str(passage.get("paper_title") or "当前论文"))
+        page = html.escape(str(passage.get("page") or "未知"))
+        preview = html.escape(cls._preview(str(passage["text"]), 120))
+        return (
+            "<div class='passage'>"
+            f"<b>选中段落 · {title} · 第 {page} 页</b><br>"
+            f"{preview}</div>"
+        )
 
     def set_busy(self, busy: bool, status: str = "") -> None:
         self.input.setEnabled(not busy)

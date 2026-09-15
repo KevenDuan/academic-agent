@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import math
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QAbstractTextDocumentLayout, QPainter, QPalette, QTextDocument
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QAbstractTextDocumentLayout,
+    QPainter,
+    QPalette,
+    QTextDocument,
+    QWheelEvent,
+)
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QListWidget,
     QStyle,
@@ -15,6 +22,64 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.pdf_parser import Block
+
+
+class SmoothScrollListWidget(QListWidget):
+    """按像素滚动，并为传统鼠标滚轮提供短促、可累计的缓动。"""
+
+    WHEEL_DISTANCE = 84
+    ANIMATION_DURATION_MS = 150
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setSingleStep(28)
+        self._scroll_target = 0
+        self._scroll_animation = QPropertyAnimation(scrollbar, b"value", self)
+        self._scroll_animation.setDuration(self.ANIMATION_DURATION_MS)
+        self._scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_animation.finished.connect(self._sync_scroll_target)
+        scrollbar.sliderPressed.connect(self.stop_smooth_scroll)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
+        # 触控板已经提供逐像素位移，保留系统原生手感。
+        if not event.pixelDelta().isNull():
+            self.stop_smooth_scroll()
+            super().wheelEvent(event)
+            self._sync_scroll_target()
+            return
+
+        angle = event.angleDelta().y()
+        if not angle:
+            super().wheelEvent(event)
+            return
+
+        scrollbar = self.verticalScrollBar()
+        if self._scroll_animation.state() == QPropertyAnimation.State.Running:
+            base = self._scroll_target
+        else:
+            base = scrollbar.value()
+        distance = -angle / 120 * self.WHEEL_DISTANCE
+        target = round(max(scrollbar.minimum(), min(scrollbar.maximum(), base + distance)))
+        if target == scrollbar.value():
+            self._scroll_target = target
+            event.accept()
+            return
+
+        self._scroll_target = target
+        self._scroll_animation.stop()
+        self._scroll_animation.setStartValue(scrollbar.value())
+        self._scroll_animation.setEndValue(target)
+        self._scroll_animation.start()
+        event.accept()
+
+    def stop_smooth_scroll(self) -> None:
+        self._scroll_animation.stop()
+        self._sync_scroll_target()
+
+    def _sync_scroll_target(self) -> None:
+        self._scroll_target = self.verticalScrollBar().value()
 
 
 class WrappedTextDelegate(QStyledItemDelegate):
@@ -73,7 +138,7 @@ class TranslationPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.list_widget = QListWidget()
+        self.list_widget = SmoothScrollListWidget()
         self.list_widget.setWordWrap(True)
         self.list_widget.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.list_widget.setSpacing(8)
@@ -84,6 +149,7 @@ class TranslationPanel(QWidget):
         layout.addWidget(self.list_widget)
 
     def set_blocks(self, blocks: list[Block]) -> None:
+        self.list_widget.stop_smooth_scroll()
         self.list_widget.clear()
         for block in blocks:
             self.list_widget.addItem(self._item_text(block))
@@ -102,6 +168,7 @@ class TranslationPanel(QWidget):
 
     def select_block(self, index: int) -> None:
         if 0 <= index < self.list_widget.count():
+            self.list_widget.stop_smooth_scroll()
             self.list_widget.setCurrentRow(index)
             self.list_widget.scrollToItem(self.list_widget.item(index))
 

@@ -137,7 +137,8 @@ class P2Tests(unittest.TestCase):
             self.assertIsInstance(splitter, QSplitter)
             self.assertEqual(splitter.count(), 3)
             self.assertIs(splitter.widget(0), window.session_sidebar)
-            self.assertIs(splitter.widget(1).layout().itemAt(1).widget(), window.pdf_view)
+            self.assertIs(splitter.widget(1).layout().itemAt(1).widget(), window.pdf_nav)
+            self.assertIs(window.pdf_nav.pdf_view, window.pdf_view)
             self.assertFalse(hasattr(window.chat_panel, "session_list"))
             self.assertFalse(hasattr(window.session_sidebar, "new_button"))
         finally:

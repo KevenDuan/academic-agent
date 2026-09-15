@@ -56,6 +56,7 @@ class SessionStore:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA secure_delete = ON")
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -155,6 +156,13 @@ class SessionStore:
             self._connection.execute(
                 "DELETE FROM sessions WHERE session_id = ?", (session_id,)
             )
+        self.compact()
+
+    def compact(self) -> None:
+        free_pages = self._connection.execute("PRAGMA freelist_count").fetchone()[0]
+        if free_pages:
+            self._connection.execute("VACUUM")
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def add_message(
         self,

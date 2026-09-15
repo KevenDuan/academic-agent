@@ -117,6 +117,7 @@ AcademicAgent/
 │   ├── agent/
 │   │   ├── agent_loop.py       # 原生 tools 循环(ReAct)
 │   │   ├── registry.py         # 技能注册表(扫描 skills/ 生成 tools)
+│   │   ├── skills.py           # 默认技能目录定位
 │   │   ├── web_search.py       # web_search 技能实现
 │   │   └── prompts.py          # 系统提示词
 │   ├── skills/                 # 技能目录(每个技能一个子文件夹)
@@ -275,7 +276,10 @@ while True:
 
 - **布局**:`QMainWindow` + `QSplitter`,左侧 PDF 阅读区,右侧停靠 `QTextEdit/QTextBrowser`(对话)
 - **深色主题**:全局 QSS(背景 `#1e1e1e` 系、卡片式容器、圆角、扁平按钮)
-- **流式输出**:`QTextEdit` 逐段 append;Qt 6.4+ 可用 markdown 渲染
+- **PDF 显示**:默认适合宽度，也支持适合整页和实际大小；依据画布尺寸与屏幕 DPR 动态渲染，缩放预览使用平滑插值并在 120 ms 防抖后重渲染；单页受 600 DPI 与 2,000 万像素双重限制
+- **悬浮翻页**:阅读区左右边缘按需淡入圆形翻页按钮，首页/末页自动隐藏无效方向；悬浮按钮转发滚轮事件，避免打断页面滚动
+- **译文滚动**:译文列表采用逐像素滚动；传统鼠标滚轮使用 150 ms 缓动并累计连续输入，触控板保持原生像素滚动
+- **消息呈现**:`QTextBrowser` 使用 `markdown-it-py` 将 CommonMark 转为安全 HTML；用户气泡右对齐，助手气泡左对齐，支持标题、列表、引用、代码块和表格，禁用原始 HTML
 - **设置页**:`QDialog` + `QFormLayout`,模型/base_url/api_key 持久化到本地 JSON
 
 > ⚠️ **顺序提醒**:先功能骨架(默认样式),再打磨美观;避免过早陷入样式调整。
@@ -373,6 +377,34 @@ CREATE TABLE messages (
 
 ---
 
+### P4 实现说明
+
+当前 P4 使用 `app/agent/agent_loop.py` 执行最多 6 轮原生 OpenAI-compatible tool calling，
+`app/agent/registry.py` 自动扫描 `app/skills/<name>/SKILL.md` 与 `skill.py`。内置技能包括
+`search_papers`、`get_paper_summary`、`extract_key_points`、`translate_text` 和 `web_search`。
+工具异常会作为 tool 结果返回模型，工具名称、参数和结果写入会话的 `tool_calls_json`。
+新增技能只需要添加一个自描述目录，不需要修改 Agent 核心代码。
+
+### P5 实现说明
+
+当前 P5 使用独立的 `app/ui/theme.py` 管理中性石墨色 QSS，并通过 QtAwesome
+提供工具栏、页码控制、标签页和操作按钮图标；QtAwesome 字体不可用时自动回退到
+Qt 原生图标。主界面保持会话 / PDF / 译文与对话三栏结构，左侧会话的新建、重命名
+和删除仍只在右键菜单出现；工具栏按钮或 `Ctrl+B` 可折叠并恢复最近对话栏。对话输入
+使用一体化 composer，将输入、响应状态和发送操作放在同一视觉区域。
+
+`app/ui/settings_dialog.py` 支持 DeepSeek、OpenAI 和自定义 OpenAI-compatible
+服务，可配置模型 ID、Base URL、API key、超时与 Tavily key。设置保存到
+`%LOCALAPPDATA%\AcademicAgent\settings.json`，并立即重建翻译、问答和 Agent
+客户端，不重新加载当前 PDF、论文数据库、BGE-M3 或 FAISS 索引。JSON 配置优先于
+`.env`，配置损坏时自动回退到环境变量。
+
+资源生命周期由主窗口统一收口：完成的 `QThread` 通过 `deleteLater()` 释放，退出时若
+存在后台任务则等待其结束后自动关闭；随后关闭 LLM HTTP client、卸载 BGE-M3、清空
+CUDA cache，并释放内存中的 FAISS 索引。删除会话或论文后执行 SQLite `VACUUM`（存在
+空闲页时）与 WAL truncate，使数据库磁盘空间实际回收。Hugging Face 下载缓存不随退出
+删除，避免每次启动重新下载模型。
+
 ## 6. 开发计划
 
 | 阶段 | 内容 | 交付物 | 难度 | 预计周期 |
@@ -382,8 +414,8 @@ CREATE TABLE messages (
 | **P2（已完成）** | 对话面板:接入 LLM + SQLite 会话持久化,"问这篇论文"跑通(无工具) | 可跨天恢复的对话阅读器 | ★★ | 1~1.5 周 |
 | **P3（已完成）** | 论文库 + RAG:BGE-M3 + SQLite + FAISS + 跨论文引用 | 论文库雏形 | ★★★ | 2~3 周 |
 | **P3.5（已完成）** | Codex 式选中段落附件 + 翻译 + 局部问答 + 消息持久化 | 段落精读工作流 | ★★ | 数天 |
-| **P4** | 技能注册表 + Agent 工具循环:`web_search` / 总结 / 要点 / 术语表 | 完整 Agent | ★★ | 1~2 周 |
-| **P5** | Codex 风格 UI 打磨 + 设置页 + 配置持久化 | 可用成品 | ★★ | 1~2 周 |
+| **P4（已完成）** | 技能注册表 + Agent 工具循环:`web_search` / 总结 / 要点 / 术语表 | 完整 Agent | ★★ | 1~2 周 |
+| **P5（已完成）** | Codex 风格 UI 打磨 + 设置页 + 配置持久化 | 可用成品 | ★★ | 1~2 周 |
 | **P6(可选)** | 集成 pdf2zh 导出双语 PDF | 附加导出 | — | 1 周 |
 
 **里程碑**:P3 完成 = 从"带 GUI 的翻译器"升级为"真正的文献 Agent"。
@@ -395,7 +427,7 @@ CREATE TABLE messages (
 - **P2**:右侧对话能回答"这篇论文主要讲什么";关闭并重启应用后可从历史会话继续对话。
 - **P3**:跨论文检索能返回带引用的相关段落。
 - **P3.5**:选中任一文本块后可翻译并作为附件提问;重启后消息仍保留段落来源。
-- **P4**:agent 能自主决定调用工具完成"总结我的方向相关论文"。
+- **P4**:agent 能自主决定调用本地检索、论文证据、翻译和实时搜索工具完成"总结我的方向相关论文"。
 - **P5**:深色 Codex 风格界面 + 设置页可切换 DeepSeek/OpenAI。
 
 ---

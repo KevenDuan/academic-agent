@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+from enum import Enum
+from math import sqrt
+
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QScrollArea, QWidget
 
 from app.core.pdf_parser import Block
+
+
+class PageViewMode(str, Enum):
+    FIT_WIDTH = "fit_width"
+    FIT_PAGE = "fit_page"
+    ACTUAL_SIZE = "actual_size"
 
 
 class PDFPageCanvas(QWidget):
@@ -64,6 +73,7 @@ class PDFPageCanvas(QWidget):
             return
 
         target = QRectF(0, 0, self._page_width * self._scale, self._page_height * self._scale)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.drawImage(target, self._image)
         if 0 <= self._selected < len(self._blocks):
             x0, y0, x1, y1 = self._blocks[self._selected].bbox
@@ -95,6 +105,12 @@ class PDFPageCanvas(QWidget):
 
 
 class PDFPageView(QScrollArea):
+    PDF_DPI = 72.0
+    RENDER_OVERSAMPLE = 1.5
+    MIN_RENDER_DPI = 110
+    MAX_RENDER_DPI = 600
+    MAX_RENDER_PIXELS = 20_000_000
+
     blockClicked = pyqtSignal(int)
     zoomPercentChanged = pyqtSignal(int)
     renderRequested = pyqtSignal()
@@ -109,8 +125,9 @@ class PDFPageView(QScrollArea):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._page_width = 1.0
         self._page_height = 1.0
-        self._fit_scale = 1.0
+        self._base_scale = 1.0
         self._zoom_factor = 1.0
+        self._view_mode = PageViewMode.FIT_WIDTH
         self._updating_fit = False
         self.canvas.blockClicked.connect(self.blockClicked.emit)
 
@@ -121,6 +138,42 @@ class PDFPageView(QScrollArea):
     def zoom_factor(self) -> float:
         return self._zoom_factor
 
+    @property
+    def view_mode(self) -> PageViewMode:
+        return self._view_mode
+
+    @property
+    def current_scale(self) -> float:
+        return self._current_scale()
+
+    def prepare_page(self, page_width: float, page_height: float) -> None:
+        self._page_width = max(1.0, page_width)
+        self._page_height = max(1.0, page_height)
+        self._zoom_factor = 1.0
+        self._update_base_scale()
+
+    def render_dpi(self, device_pixel_ratio: float | None = None) -> int:
+        ratio = device_pixel_ratio or self.devicePixelRatioF()
+        requested = (
+            self.PDF_DPI
+            * self._current_scale()
+            * max(1.0, ratio)
+            * self.RENDER_OVERSAMPLE
+        )
+        pixel_limited = self.PDF_DPI * sqrt(
+            self.MAX_RENDER_PIXELS / (self._page_width * self._page_height)
+        )
+        return max(
+            1,
+            int(
+                min(
+                    max(self.MIN_RENDER_DPI, requested),
+                    self.MAX_RENDER_DPI,
+                    pixel_limited,
+                )
+            ),
+        )
+
     def set_page(
         self,
         pixmap: QPixmap,
@@ -129,16 +182,13 @@ class PDFPageView(QScrollArea):
         blocks: list[Block],
         selected: int = -1,
     ) -> None:
-        self._page_width = page_width
-        self._page_height = page_height
-        self._zoom_factor = 1.0
-        self._update_fit_scale()
+        self.prepare_page(page_width, page_height)
         self.canvas.set_page(
             pixmap,
             page_width,
             page_height,
             blocks,
-            self._fit_scale,
+            self._current_scale(),
             selected,
         )
         self.horizontalScrollBar().setValue(0)
@@ -157,25 +207,46 @@ class PDFPageView(QScrollArea):
     def zoom_out(self) -> None:
         self._zoom_at(1 / 1.2)
 
+    def reset_zoom(self) -> None:
+        self.set_view_mode(self._view_mode)
+
+    def fit_width(self) -> None:
+        self.set_view_mode(PageViewMode.FIT_WIDTH)
+
     def fit_page(self) -> None:
+        self.set_view_mode(PageViewMode.FIT_PAGE)
+
+    def actual_size(self) -> None:
+        self.set_view_mode(PageViewMode.ACTUAL_SIZE)
+
+    def set_view_mode(self, mode: PageViewMode | str) -> None:
+        self._view_mode = PageViewMode(mode)
         self._zoom_factor = 1.0
-        self._update_fit_scale()
-        self.canvas.set_image(self.canvas._image, self._fit_scale)
+        self._update_base_scale()
+        if not self.canvas._image.isNull():
+            self.canvas.set_image(self.canvas._image, self._current_scale())
         self.horizontalScrollBar().setValue(0)
         self.verticalScrollBar().setValue(0)
         self.zoomPercentChanged.emit(100)
-        self.renderRequested.emit()
+        if not self.canvas._image.isNull():
+            self.renderRequested.emit()
 
-    def _update_fit_scale(self) -> None:
+    def _update_base_scale(self) -> None:
         viewport = self.viewport().size()
         margin = 18.0
-        self._fit_scale = min(
-            max(1.0, viewport.width() - 2 * margin) / self._page_width,
-            max(1.0, viewport.height() - 2 * margin) / self._page_height,
-        )
+        width_scale = max(1.0, viewport.width() - 2 * margin) / self._page_width
+        if self._view_mode == PageViewMode.FIT_WIDTH:
+            self._base_scale = width_scale
+        elif self._view_mode == PageViewMode.FIT_PAGE:
+            self._base_scale = min(
+                width_scale,
+                max(1.0, viewport.height() - 2 * margin) / self._page_height,
+            )
+        else:
+            self._base_scale = max(1.0, float(self.logicalDpiX())) / self.PDF_DPI
 
     def _current_scale(self) -> float:
-        return self._fit_scale * self._zoom_factor
+        return self._base_scale * self._zoom_factor
 
     def _zoom_at(self, multiplier: float, position: QPointF | None = None) -> None:
         if self.canvas._image.isNull():
@@ -221,12 +292,17 @@ class PDFPageView(QScrollArea):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().resizeEvent(event)
-        self._update_fit_scale()
         if (
-            self._zoom_factor == 1.0
-            and not self.canvas._image.isNull()
+            self._view_mode != PageViewMode.ACTUAL_SIZE
             and not self._updating_fit
         ):
             self._updating_fit = True
-            self.canvas.set_image(self.canvas._image, self._fit_scale)
+            old_scale = self._current_scale()
+            self._update_base_scale()
+            if (
+                not self.canvas._image.isNull()
+                and abs(self._current_scale() - old_scale) > 0.001
+            ):
+                self.canvas.set_image(self.canvas._image, self._current_scale())
+                self.renderRequested.emit()
             self._updating_fit = False

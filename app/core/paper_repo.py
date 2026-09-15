@@ -47,6 +47,7 @@ class PaperRepository:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
+        self._connection.execute("PRAGMA secure_delete = ON")
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -236,6 +237,13 @@ class PaperRepository:
             self._connection.execute("DELETE FROM papers WHERE paper_id = ?", (paper_id,))
             if not self.list_papers():
                 self._connection.execute("DELETE FROM paper_settings")
+        self.compact()
+
+    def compact(self) -> None:
+        free_pages = self._connection.execute("PRAGMA freelist_count").fetchone()[0]
+        if free_pages:
+            self._connection.execute("VACUUM")
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def embedding_count(self) -> int:
         return int(
@@ -261,6 +269,12 @@ class PaperRepository:
             raise RuntimeError("论文库中的 Embedding 维度损坏")
         ids = np.asarray([row["block_id"] for row in rows], dtype=np.int64)
         return ids, vectors
+
+    def load_embedding_ids(self) -> np.ndarray:
+        rows = self._connection.execute(
+            "SELECT block_id FROM paper_blocks ORDER BY block_id"
+        ).fetchall()
+        return np.asarray([row["block_id"] for row in rows], dtype=np.int64)
 
     def get_blocks(self, block_ids: list[int]) -> dict[int, IndexedBlock]:
         if not block_ids:

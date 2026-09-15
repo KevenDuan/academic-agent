@@ -32,6 +32,7 @@ def codex_dark_stylesheet() -> str:
     QListWidget, QTextBrowser, QTextEdit { background: #303234; border: 1px solid #484b4d; border-radius: 5px; selection-background-color: #405a4b; }
     QListWidget { alternate-background-color: #333537; outline: none; }
     QListWidget::item { border-bottom: 1px solid #424446; padding: 0px; }
+    QListWidget#sessionList::item { padding: 6px 8px; }
     QListWidget::item:hover { background: #3a3c3e; }
     QListWidget::item:selected { background: #3d5146; color: #f2fff7; }
     QTextBrowser#chatMessages { background: #2e2f31; border: none; padding: 8px 10px; }

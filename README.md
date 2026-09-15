@@ -11,6 +11,7 @@ persistent conversations, and tool-using LLM workflows in a PyQt6 desktop applic
 - Block-level text extraction and translation
 - Local paper library with FAISS-based RAG
 - Persistent chat sessions
+- Markdown chat with distinct user and assistant bubbles
 - OpenAI and DeepSeek compatible APIs
 - Tool-calling agent loop
 - Pluggable skills system
@@ -38,6 +39,12 @@ take precedence over `.env` on the next launch and are stored locally in
 The API keys in this file are local plaintext credentials. Keep the file out of
 version control and restrict access to your Windows account.
 
+When a conversation or indexed paper is deleted, AcademicAgent compacts its
+SQLite database and truncates the WAL so the released disk space is returned to
+the operating system. Closing the application waits for active workers, closes
+LLM connections, and releases the in-memory FAISS index and BGE-M3 model. The
+downloaded Hugging Face model cache is intentionally retained for reuse.
+
 ## Run locally
 
 ```powershell
@@ -57,6 +64,19 @@ the center, and translation/chat tabs on the right. Right-click the conversation
 sidebar to create, rename, or delete a session. The local database is stored
 in the operating system's AcademicAgent user data directory; deleting a
 conversation never deletes its PDF file.
+
+The PDF reader defaults to fit-width mode and also provides fit-page and actual-
+size modes. Pages are rendered for the current display size and device pixel
+ratio, then refreshed after zooming or resizing. Smooth preview scaling keeps
+interaction responsive while a DPI and pixel cap limits peak memory use.
+Moving the pointer to either side of the PDF reveals compact circular page
+controls. Unavailable directions stay hidden on the first and last pages, and
+the mouse wheel continues scrolling while the pointer is over a control.
+
+Chat messages render CommonMark Markdown, including headings, emphasis, lists,
+quotes, fenced code blocks, tables, and links. User turns appear on the right
+and Academic Agent turns on the left. Raw HTML in messages is displayed as text
+instead of being interpreted by the interface.
 
 ## Selected-passage questions
 

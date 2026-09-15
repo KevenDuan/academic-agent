@@ -6,6 +6,7 @@ from PyQt6.QtCore import QObject, QSize, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QKeySequence, QPixmap, QIcon
 from PyQt6.QtWidgets import (
     QDialog,
+    QComboBox,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -35,7 +36,8 @@ from app.resources import resource_path
 from app.ui.chat_panel import ChatPanel, ElidedLabel, SessionSidebar
 from app.ui.icons import app_icon
 from app.ui.paper_library_dialog import PaperLibraryDialog
-from app.ui.pdf_viewer import PDFPageView
+from app.ui.pdf_nav_view import PDFNavigationView
+from app.ui.pdf_viewer import PDFPageView, PageViewMode
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.theme import codex_dark_stylesheet
 from app.ui.translation_panel import TranslationPanel
@@ -215,12 +217,15 @@ class MainWindow(QMainWindow):
         self._translation_threads: dict[tuple[int, int, int], QThread] = {}
         self._translation_workers: dict[tuple[int, int, int], TranslationWorker] = {}
         self._inflight: set[tuple[int, int, int]] = set()
+        self._close_requested = False
+        self._resources_closed = False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.setInterval(120)
         self._render_timer.timeout.connect(self._rerender_current_page)
 
         self.pdf_view = PDFPageView()
+        self.pdf_nav = PDFNavigationView(self.pdf_view)
         self.translation_panel = TranslationPanel()
         self.chat_panel = ChatPanel()
         self.session_sidebar = SessionSidebar()
@@ -235,7 +240,14 @@ class MainWindow(QMainWindow):
         self.zoom_out_button = QPushButton()
         self.zoom_reset_button = QPushButton("100%")
         self.zoom_in_button = QPushButton()
-        self.fit_button = QPushButton()
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.setObjectName("viewModeCombo")
+        self.view_mode_combo.addItem("适合宽度", PageViewMode.FIT_WIDTH.value)
+        self.view_mode_combo.addItem("适合整页", PageViewMode.FIT_PAGE.value)
+        self.view_mode_combo.addItem("实际大小", PageViewMode.ACTUAL_SIZE.value)
+        self.view_mode_combo.setCurrentIndex(0)
+        self.view_mode_combo.setFixedWidth(96)
+        self.view_mode_combo.setToolTip("PDF 页面显示模式")
         self.page_spin = QSpinBox()
         self.page_spin.setMinimum(1)
         self.page_spin.setMaximum(1)
@@ -245,7 +257,6 @@ class MainWindow(QMainWindow):
             (self.next_button, "fa5s.chevron-right", "下一页"),
             (self.zoom_out_button, "fa5s.search-minus", "缩小"),
             (self.zoom_in_button, "fa5s.search-plus", "放大"),
-            (self.fit_button, "fa5s.expand", "适应页面"),
         ):
             button.setIcon(app_icon(icon))
             button.setToolTip(tooltip)
@@ -255,11 +266,12 @@ class MainWindow(QMainWindow):
             self.zoom_out_button,
             self.zoom_reset_button,
             self.zoom_in_button,
-            self.fit_button,
         ):
             button.setFixedHeight(28)
         self.zoom_reset_button.setFixedWidth(58)
         self.zoom_reset_button.setToolTip("重置缩放")
+        self.previous_button.setEnabled(False)
+        self.next_button.setEnabled(False)
 
         self._build_ui()
         self._connect_signals()
@@ -330,7 +342,7 @@ class MainWindow(QMainWindow):
         page_controls.addWidget(self.zoom_out_button)
         page_controls.addWidget(self.zoom_reset_button)
         page_controls.addWidget(self.zoom_in_button)
-        page_controls.addWidget(self.fit_button)
+        page_controls.addWidget(self.view_mode_combo)
         page_controls.addStretch()
         page_controls.addWidget(self.page_label)
         page_controls.addWidget(self.page_spin)
@@ -353,7 +365,7 @@ class MainWindow(QMainWindow):
         document_layout.setContentsMargins(10, 8, 10, 10)
         document_layout.setSpacing(8)
         document_layout.addWidget(document_header_widget)
-        document_layout.addWidget(self.pdf_view, 1)
+        document_layout.addWidget(self.pdf_nav, 1)
 
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.workspace_splitter.setChildrenCollapsible(False)
@@ -379,10 +391,16 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.previous_button.clicked.connect(self.previous_page)
         self.next_button.clicked.connect(self.next_page)
+        self.pdf_nav.previousRequested.connect(self.previous_page)
+        self.pdf_nav.nextRequested.connect(self.next_page)
         self.zoom_out_button.clicked.connect(self.pdf_view.zoom_out)
-        self.zoom_reset_button.clicked.connect(self.pdf_view.fit_page)
+        self.zoom_reset_button.clicked.connect(self.pdf_view.reset_zoom)
         self.zoom_in_button.clicked.connect(self.pdf_view.zoom_in)
-        self.fit_button.clicked.connect(self.pdf_view.fit_page)
+        self.view_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.pdf_view.set_view_mode(
+                self.view_mode_combo.currentData()
+            )
+        )
         self.pdf_view.zoomPercentChanged.connect(
             lambda value: self.zoom_reset_button.setText(f"{value}%")
         )
@@ -442,6 +460,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._release_index_worker)
+        thread.finished.connect(thread.deleteLater)
         self._index_thread = thread
         self._index_worker = worker
         self.add_to_library_action.setEnabled(False)
@@ -471,6 +490,7 @@ class MainWindow(QMainWindow):
     def _release_index_worker(self) -> None:
         self._index_worker = None
         self._index_thread = None
+        self._finish_pending_close()
 
     def show_paper_library(self) -> None:
         dialog = PaperLibraryDialog(self)
@@ -482,6 +502,13 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def show_settings(self) -> None:
+        if self._llm_work_is_running():
+            QMessageBox.information(
+                self,
+                "模型正在使用中",
+                "请等待当前翻译或回答完成后再修改模型设置。",
+            )
+            return
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -496,6 +523,7 @@ class MainWindow(QMainWindow):
 
     def _apply_runtime_settings(self, settings: AppSettings) -> None:
         settings.apply_to_environment()
+        previous_translator = self.translator
         translator = Translator(
             api_key=settings.api_key or None,
             base_url=settings.base_url or None,
@@ -511,6 +539,9 @@ class MainWindow(QMainWindow):
             self.rag_engine,
             translator,
         )
+        close_previous = getattr(previous_translator, "close", None)
+        if callable(close_previous):
+            close_previous()
 
     def _open_library_paper(self, dialog: PaperLibraryDialog, path: str) -> None:
         paper_path = Path(path)
@@ -539,8 +570,17 @@ class MainWindow(QMainWindow):
             return
         page_number = max(0, min(page_number, self.document.page_count - 1))
         self.current_page = page_number
+        has_previous = page_number > 0
+        has_next = page_number < self.document.page_count - 1
+        self.previous_button.setEnabled(has_previous)
+        self.next_button.setEnabled(has_next)
+        self.pdf_nav.set_page_state(page_number, self.document.page_count)
         page = self.document.pages[page_number]
-        pixmap = self.document.render_page(page_number, dpi=200)
+        self.pdf_view.prepare_page(page.width, page.height)
+        pixmap = self.document.render_page(
+            page_number,
+            dpi=self.pdf_view.render_dpi(),
+        )
         self.pdf_view.set_page(
             self._to_qpixmap(pixmap), page.width, page.height, page.blocks
         )
@@ -568,14 +608,18 @@ class MainWindow(QMainWindow):
     def _rerender_current_page(self) -> None:
         if not self.document or not self.document.pages:
             return
-        dpi = max(200, min(600, round(200 * self.pdf_view.zoom_factor)))
+        dpi = self.pdf_view.render_dpi()
         pixmap = self.document.render_page(self.current_page, dpi=dpi)
         self.pdf_view.set_image(self._to_qpixmap(pixmap))
 
     def previous_page(self) -> None:
+        if not self.document or self.current_page <= 0:
+            return
         self.show_page(self.current_page - 1)
 
     def next_page(self) -> None:
+        if not self.document or self.current_page >= self.document.page_count - 1:
+            return
         self.show_page(self.current_page + 1)
 
     def select_block(self, index: int) -> None:
@@ -623,6 +667,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda: self._release_translation(thread_key))
+        thread.finished.connect(thread.deleteLater)
         self._translation_threads[thread_key] = thread
         self._translation_workers[thread_key] = worker
         self.translation_panel.set_pending(index, block)
@@ -632,6 +677,7 @@ class MainWindow(QMainWindow):
         self._inflight.discard(thread_key)
         self._translation_workers.pop(thread_key, None)
         self._translation_threads.pop(thread_key, None)
+        self._finish_pending_close()
 
     def _translation_finished(
         self, generation: int, page_number: int, index: int, translation: str
@@ -786,6 +832,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._release_chat_worker)
+        thread.finished.connect(thread.deleteLater)
         self._chat_thread = thread
         self._chat_worker = worker
         thread.start()
@@ -844,22 +891,47 @@ class MainWindow(QMainWindow):
     def _release_chat_worker(self) -> None:
         self._chat_worker = None
         self._chat_thread = None
+        self._finish_pending_close()
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if self._index_thread and self._index_thread.isRunning():
-            self.statusBar().showMessage("论文索引仍在进行，请等待完成后再关闭。")
-            event.ignore()
+    def _llm_work_is_running(self) -> bool:
+        return bool(
+            (self._chat_thread and self._chat_thread.isRunning())
+            or any(thread.isRunning() for thread in self._translation_threads.values())
+        )
+
+    def _work_is_running(self) -> bool:
+        return bool(
+            self._llm_work_is_running()
+            or (self._index_thread and self._index_thread.isRunning())
+        )
+
+    def _finish_pending_close(self) -> None:
+        if self._close_requested and not self._work_is_running():
+            QTimer.singleShot(0, self.close)
+
+    def _close_resources(self) -> None:
+        if self._resources_closed:
             return
-        if self._chat_thread and self._chat_thread.isRunning():
-            self.chat_panel.set_busy(True, "模型仍在响应，请等待完成后再关闭。")
-            self.session_sidebar.set_busy(True)
-            event.ignore()
-            return
-        for thread in self._translation_threads.values():
-            thread.quit()
-            thread.wait(1000)
+        close_translator = getattr(self.translator, "close", None)
+        if callable(close_translator):
+            close_translator()
         if self.document:
             self.document.close()
+            self.document = None
         self.session_store.close()
         self.rag_engine.close()
+        self._resources_closed = True
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._work_is_running():
+            self._close_requested = True
+            close_translator = getattr(self.translator, "close", None)
+            if callable(close_translator):
+                close_translator()
+            self.chat_panel.set_busy(True, "正在结束后台任务，完成后将自动退出…")
+            self.session_sidebar.set_busy(True)
+            self.statusBar().showMessage("正在结束后台任务，完成后将自动退出…")
+            event.ignore()
+            return
+        self._close_resources()
         event.accept()
